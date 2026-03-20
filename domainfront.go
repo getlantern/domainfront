@@ -116,7 +116,15 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 		opt(c)
 	}
 
-	c.applyConfig(config)
+	// Clamp crawler concurrency to avoid deadlock with zero-capacity semaphore
+	if c.crawlerConcurrency < 1 {
+		c.crawlerConcurrency = 1
+	}
+
+	if err := c.applyConfig(config); err != nil {
+		cancel()
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 
 	// Load cached state
 	cached, err := c.cache.Load()
@@ -168,10 +176,9 @@ func (c *Client) certPool() *x509.CertPool {
 	return pool
 }
 
-func (c *Client) applyConfig(cfg *Config) {
+func (c *Client) applyConfig(cfg *Config) error {
 	if len(cfg.Providers) == 0 {
-		c.log.Error("No providers in config")
-		return
+		return fmt.Errorf("no providers configured")
 	}
 
 	expanded := make(map[string]*Provider, len(cfg.Providers))
@@ -183,7 +190,11 @@ func (c *Client) applyConfig(cfg *Config) {
 	c.providers = expanded
 	c.providersMu.Unlock()
 
-	c.certPoolValue.Store(cfg.CertPool())
+	certPool, err := cfg.CertPool()
+	if err != nil {
+		return fmt.Errorf("cert pool: %w", err)
+	}
+	c.certPoolValue.Store(certPool)
 
 	var fronts []*front
 	for providerID, p := range expanded {
@@ -196,6 +207,7 @@ func (c *Client) applyConfig(cfg *Config) {
 
 	c.pool.Replace(fronts)
 	c.log.Debug("Applied config", "providers", len(expanded), "fronts", len(fronts))
+	return nil
 }
 
 func (c *Client) providerFor(f *front) *Provider {
@@ -358,7 +370,13 @@ func (c *Client) configUpdater() {
 }
 
 func (c *Client) fetchAndApplyConfig() {
-	resp, err := c.httpClient.Get(c.configURL)
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.configURL, nil)
+	if err != nil {
+		c.log.Warn("Failed to create config request", "error", err)
+		return
+	}
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.log.Warn("Failed to fetch config", "url", c.configURL, "error", err)
 		return
@@ -383,7 +401,9 @@ func (c *Client) fetchAndApplyConfig() {
 	}
 
 	c.log.Info("Applying updated config", "providers", len(cfg.Providers))
-	c.applyConfig(cfg)
+	if err := c.applyConfig(cfg); err != nil {
+		c.log.Warn("Failed to apply config update", "error", err)
+	}
 }
 
 // DefaultCacheFilePath returns the default path for the fronts cache file.
@@ -409,10 +429,14 @@ func ParseConfigFromFile(path string) (*Config, error) {
 }
 
 // ParseConfigFromReader reads gzipped YAML from a reader.
+// Input is limited to maxConfigSize (50 MB) to prevent excessive memory use.
 func ParseConfigFromReader(r io.Reader) (*Config, error) {
-	data, err := io.ReadAll(r)
+	data, err := io.ReadAll(io.LimitReader(r, maxConfigSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+	if len(data) > maxConfigSize {
+		return nil, fmt.Errorf("config size exceeds maximum of %d bytes", maxConfigSize)
 	}
 	return ParseConfig(data)
 }

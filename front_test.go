@@ -24,7 +24,23 @@ func TestFrontPool_TakeReturn(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "1.2.3.4", got.IpAddress)
 
+	pool.ReturnSuccess(got)
+	assert.Equal(t, 1, pool.readyCount())
+	assert.True(t, got.isSucceeding(), "ReturnSuccess should mark as succeeded")
+}
+
+func TestFrontPool_ReturnRequeue(t *testing.T) {
+	pool := newFrontPool()
+	f := newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}, "test")
+	pool.addReady(f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	got, _ := pool.Take(ctx)
+	// Return with requeue=true should not update LastSucceeded
 	pool.Return(got, true)
+	assert.False(t, got.isSucceeding(), "Return(requeue=true) should not mark as succeeded")
 	assert.Equal(t, 1, pool.readyCount())
 }
 

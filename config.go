@@ -100,12 +100,15 @@ func ParseConfigYAML(yml []byte) (*Config, error) {
 }
 
 // CertPool builds an x509.CertPool from the config's trusted CAs.
-func (cfg *Config) CertPool() *x509.CertPool {
+// Returns an error if any CA certificate fails to parse.
+func (cfg *Config) CertPool() (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
-	for _, ca := range cfg.TrustedCAs {
-		pool.AppendCertsFromPEM([]byte(ca.Cert))
+	for i, ca := range cfg.TrustedCAs {
+		if ok := pool.AppendCertsFromPEM([]byte(ca.Cert)); !ok {
+			return nil, fmt.Errorf("failed to parse trusted CA at index %d (%s)", i, ca.CommonName)
+		}
 	}
-	return pool
+	return pool, nil
 }
 
 // ExpandedProvider returns a copy of the provider with masquerades expanded

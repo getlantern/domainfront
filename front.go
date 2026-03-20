@@ -131,14 +131,23 @@ func (p *frontPool) Take(ctx context.Context) (*front, error) {
 	}
 }
 
-// Return puts a front back into the ready queue if it succeeded.
-func (p *frontPool) Return(f *front, succeeded bool) {
-	if succeeded {
-		f.markSucceeded()
+// Return puts a front back into the ready queue without updating its success
+// timestamp. Use this when the front should be kept in rotation but no real
+// round trip occurred (e.g. provider mapping miss). Pass requeue=false to
+// mark the front as failed and remove it from rotation.
+func (p *frontPool) Return(f *front, requeue bool) {
+	if requeue {
 		p.addReady(f)
 	} else {
 		f.markFailed()
 	}
+}
+
+// ReturnSuccess records a real successful round trip and puts the front back
+// into the ready queue.
+func (p *frontPool) ReturnSuccess(f *front) {
+	f.markSucceeded()
+	p.addReady(f)
 }
 
 // Close shuts down the pool, unblocking any pending Take calls.
