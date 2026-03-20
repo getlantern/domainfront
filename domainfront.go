@@ -1,0 +1,431 @@
+package domainfront
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand/v2"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	tls "github.com/refraction-networking/utls"
+)
+
+const (
+	defaultMaxAllowedCachedAge = 24 * time.Hour
+	defaultMaxCacheSize        = 1000
+	defaultCacheSaveInterval   = 5 * time.Second
+	defaultMaxRetries          = 6
+	defaultCrawlerConcurrency  = 10
+	defaultProviderID          = "cloudfront"
+	maxConfigSize              = 50 << 20 // 50 MB
+)
+
+// Client is the main entry point for domain fronting. It manages a pool of
+// fronts, background crawling, caching, and config updates. All state is
+// contained in the Client — there is no global state.
+type Client struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	log    *slog.Logger
+
+	pool          *frontPool
+	providers     map[string]*Provider
+	providersMu   sync.RWMutex
+	certPoolValue atomic.Value // *x509.CertPool
+
+	dialer        Dialer
+	clientHelloID tls.ClientHelloID
+	countryCode   string
+	defaultPID    string
+	maxRetries    int
+
+	cache             Cache
+	maxCacheSize      int
+	maxCachedAge      time.Duration
+	cacheSaveInterval time.Duration
+	cacheDirty        chan struct{}
+
+	configURL  string
+	httpClient *http.Client
+
+	crawlerConcurrency int
+	wg                 sync.WaitGroup
+}
+
+// Option configures a Client.
+type Option func(*Client)
+
+func WithLogger(l *slog.Logger) Option        { return func(c *Client) { c.log = l } }
+func WithDialer(d Dialer) Option              { return func(c *Client) { c.dialer = d } }
+func WithCountryCode(cc string) Option        { return func(c *Client) { c.countryCode = cc } }
+func WithDefaultProviderID(id string) Option  { return func(c *Client) { c.defaultPID = id } }
+func WithConfigURL(url string) Option         { return func(c *Client) { c.configURL = url } }
+func WithHTTPClient(hc *http.Client) Option   { return func(c *Client) { c.httpClient = hc } }
+func WithCache(cache Cache) Option            { return func(c *Client) { c.cache = cache } }
+func WithMaxRetries(n int) Option             { return func(c *Client) { c.maxRetries = n } }
+func WithClientHelloID(id tls.ClientHelloID) Option {
+	return func(c *Client) { c.clientHelloID = id }
+}
+func WithCrawlerConcurrency(n int) Option { return func(c *Client) { c.crawlerConcurrency = n } }
+
+// WithCacheFile is a convenience option that sets a FileCache at the given path.
+func WithCacheFile(path string) Option {
+	return func(c *Client) { c.cache = &FileCache{Path: path} }
+}
+
+// New creates a new domain fronting Client and starts background goroutines.
+// The provided config is the initial (typically embedded) configuration.
+// Pass a cancellable context to control the Client's lifetime, or call Close().
+func New(ctx context.Context, config *Config, options ...Option) (*Client, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config must not be nil")
+	}
+
+	innerCtx, cancel := context.WithCancel(ctx)
+	c := &Client{
+		ctx:                innerCtx,
+		cancel:             cancel,
+		log:                slog.Default(),
+		pool:               newFrontPool(),
+		providers:          make(map[string]*Provider),
+		dialer:             NetDialer{},
+		clientHelloID:      tls.HelloChrome_131,
+		defaultPID:         defaultProviderID,
+		maxRetries:         defaultMaxRetries,
+		cache:              NopCache{},
+		maxCacheSize:       defaultMaxCacheSize,
+		maxCachedAge:       defaultMaxAllowedCachedAge,
+		cacheSaveInterval:  defaultCacheSaveInterval,
+		cacheDirty:         make(chan struct{}, 1),
+		httpClient:         http.DefaultClient,
+		crawlerConcurrency: defaultCrawlerConcurrency,
+	}
+
+	for _, opt := range options {
+		opt(c)
+	}
+
+	c.applyConfig(config)
+
+	// Load cached state
+	cached, err := c.cache.Load()
+	if err != nil {
+		c.log.Warn("Failed to load cache", "error", err)
+	} else if len(cached) > 0 {
+		c.log.Debug("Loaded cached fronts", "count", len(cached))
+		fronts := c.pool.candidates()
+		applyCachedState(fronts, cached, c.maxCachedAge)
+	}
+
+	// Start background goroutines
+	c.wg.Add(2)
+	go c.crawler()
+	go c.cacheSaver()
+
+	if c.configURL != "" {
+		c.wg.Add(1)
+		go c.configUpdater()
+	}
+
+	return c, nil
+}
+
+// RoundTripper returns an http.RoundTripper that sends requests via domain fronting.
+func (c *Client) RoundTripper() http.RoundTripper {
+	return &roundTripper{client: c}
+}
+
+// Close shuts down all background goroutines and the front pool.
+func (c *Client) Close() {
+	c.cancel()
+	c.pool.Close()
+	c.wg.Wait()
+
+	// Final cache save
+	c.saveCache()
+}
+
+func (c *Client) certPool() *x509.CertPool {
+	if pool, ok := c.certPoolValue.Load().(*x509.CertPool); ok && pool != nil {
+		return pool
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		c.log.Warn("Failed to load system cert pool", "error", err)
+		return x509.NewCertPool()
+	}
+	return pool
+}
+
+func (c *Client) applyConfig(cfg *Config) {
+	if len(cfg.Providers) == 0 {
+		c.log.Error("No providers in config")
+		return
+	}
+
+	expanded := make(map[string]*Provider, len(cfg.Providers))
+	for id, p := range cfg.Providers {
+		expanded[id] = ExpandedProvider(p, c.countryCode)
+	}
+
+	c.providersMu.Lock()
+	c.providers = expanded
+	c.providersMu.Unlock()
+
+	c.certPoolValue.Store(cfg.CertPool())
+
+	var fronts []*front
+	for providerID, p := range expanded {
+		for _, m := range p.Masquerades {
+			fronts = append(fronts, newFront(m, providerID))
+		}
+	}
+
+	rand.Shuffle(len(fronts), func(i, j int) { fronts[i], fronts[j] = fronts[j], fronts[i] })
+
+	c.pool.Replace(fronts)
+	c.log.Debug("Applied config", "providers", len(expanded), "fronts", len(fronts))
+}
+
+func (c *Client) providerFor(f *front) *Provider {
+	pid := f.ProviderID
+	if pid == "" {
+		pid = c.defaultPID
+	}
+	c.providersMu.RLock()
+	defer c.providersMu.RUnlock()
+	return c.providers[pid]
+}
+
+func (c *Client) notifyCacheDirty() {
+	select {
+	case c.cacheDirty <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) crawler() {
+	defer c.wg.Done()
+
+	for {
+		if c.pool.readyCount() < 2 {
+			c.crawlAllFronts()
+		}
+
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(time.Duration(6+rand.IntN(7)) * time.Second):
+		}
+	}
+}
+
+func (c *Client) crawlAllFronts() {
+	candidates := c.pool.candidates()
+	if len(candidates) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, c.crawlerConcurrency)
+	var wg sync.WaitGroup
+
+	for _, f := range candidates {
+		if c.ctx.Err() != nil {
+			break
+		}
+		if c.pool.readyCount() >= 4 {
+			break
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(f *front) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if c.ctx.Err() != nil {
+				return
+			}
+
+			if c.vetFront(f) {
+				f.markSucceeded()
+				c.pool.addReady(f)
+				c.notifyCacheDirty()
+			} else {
+				f.markFailed()
+				c.notifyCacheDirty()
+			}
+		}(f)
+	}
+
+	wg.Wait()
+}
+
+func (c *Client) vetFront(f *front) bool {
+	result := dialFront(c.ctx, f, c.certPool(), c.clientHelloID, c.dialer)
+	if result.err != nil {
+		c.log.Debug("Failed to dial front", "ip", f.IpAddress, "domain", f.Domain, "error", result.err)
+		return false
+	}
+	defer result.conn.Close()
+
+	provider := c.providerFor(f)
+	if provider == nil || provider.TestURL == "" {
+		return false
+	}
+
+	return c.verifyWithPost(result.conn, provider.TestURL)
+}
+
+func (c *Client) verifyWithPost(conn net.Conn, testURL string) bool {
+	tr := newConnTransport(conn, true)
+	client := &http.Client{Transport: tr}
+	req, err := http.NewRequest(http.MethodPost, testURL, strings.NewReader("a"))
+	if err != nil {
+		c.log.Debug("Error creating vet request", "error", err)
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		c.log.Debug("Error vetting front", "error", err, "url", testURL)
+		return false
+	}
+	if resp.Body != nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		c.log.Debug("Unexpected status vetting front", "expected", 202, "got", resp.StatusCode)
+		return false
+	}
+	return true
+}
+
+func (c *Client) cacheSaver() {
+	defer c.wg.Done()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(c.cacheSaveInterval):
+			select {
+			case <-c.cacheDirty:
+				c.saveCache()
+			default:
+			}
+		}
+	}
+}
+
+func (c *Client) saveCache() {
+	candidates := c.pool.candidates()
+	cached := frontsToCache(candidates, c.maxCacheSize)
+	if err := c.cache.Save(cached); err != nil {
+		c.log.Warn("Failed to save cache", "error", err)
+	}
+}
+
+func (c *Client) configUpdater() {
+	defer c.wg.Done()
+
+	// Fetch immediately on startup, then every 12 hours
+	c.fetchAndApplyConfig()
+
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.fetchAndApplyConfig()
+		}
+	}
+}
+
+func (c *Client) fetchAndApplyConfig() {
+	resp, err := c.httpClient.Get(c.configURL)
+	if err != nil {
+		c.log.Warn("Failed to fetch config", "url", c.configURL, "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.log.Warn("Config fetch returned non-200 status", "status", resp.StatusCode)
+		return
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxConfigSize))
+	if err != nil {
+		c.log.Warn("Failed to read config response", "error", err)
+		return
+	}
+
+	cfg, err := ParseConfig(data)
+	if err != nil {
+		c.log.Warn("Failed to parse config", "error", err)
+		return
+	}
+
+	c.log.Info("Applying updated config", "providers", len(cfg.Providers))
+	c.applyConfig(cfg)
+}
+
+// DefaultCacheFilePath returns the default path for the fronts cache file.
+func DefaultCacheFilePath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	path := filepath.Join(dir, "domainfronting")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		// Fall through; the write will fail later with a clear error
+	}
+	return filepath.Join(path, "domainfront_cache.json")
+}
+
+// ParseConfigFromFile reads and parses a gzipped config from a file path.
+func ParseConfigFromFile(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfig(data)
+}
+
+// ParseConfigFromReader reads gzipped YAML from a reader.
+func ParseConfigFromReader(r io.Reader) (*Config, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	return ParseConfig(data)
+}
+
+// CompressConfig gzip-compresses YAML config bytes.
+func CompressConfig(yamlBytes []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(yamlBytes); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
