@@ -65,7 +65,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, fmt.Errorf("failed to get request body: %w", bodyErr)
 		}
 
-		resp, err := rt.doRequest(req, result.conn, frontedHost, originHost, body)
+		resp, err := rt.doRequest(req, result.conn, frontedHost, body)
 		if err != nil {
 			rt.client.pool.Return(f, false)
 			rt.client.notifyCacheDirty()
@@ -82,8 +82,8 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return nil, fmt.Errorf("domain fronting failed after %d attempts: %w", rt.client.maxRetries, lastErr)
 }
 
-func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost, originHost string, body io.ReadCloser) (*http.Response, error) {
-	fronted, err := rewriteRequest(req, frontedHost, originHost, body)
+func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost string, body io.ReadCloser) (*http.Response, error) {
+	fronted, err := rewriteRequest(req, frontedHost, body)
 	if err != nil {
 		return nil, err
 	}
@@ -137,17 +137,13 @@ func (sr *schemeRewriter) RoundTrip(req *http.Request) (*http.Response, error) {
 	return sr.Transport.RoundTrip(norm)
 }
 
-func rewriteRequest(req *http.Request, frontedHost, originHost string, body io.ReadCloser) (*http.Request, error) {
+func rewriteRequest(req *http.Request, frontedHost string, body io.ReadCloser) (*http.Request, error) {
 	urlCopy := *req.URL
 	urlCopy.Host = frontedHost
 	r, err := http.NewRequestWithContext(req.Context(), req.Method, urlCopy.String(), body)
 	if err != nil {
 		return nil, err
 	}
-	// Set Host header to the original origin so the CDN routes to the
-	// correct backend. The URL.Host is the fronted domain for the TLS
-	// connection, but Host header must carry the real destination.
-	r.Host = originHost
 	r.ContentLength = req.ContentLength
 	for k, vs := range req.Header {
 		if !strings.EqualFold(k, "Host") {
