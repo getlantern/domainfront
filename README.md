@@ -4,6 +4,8 @@ A clean, production-grade domain fronting library for Go.
 
 `domainfront` tunnels HTTP traffic through CDN infrastructure (CloudFront, Akamai, etc.) using domain fronting — connecting to a CDN edge IP with one hostname in the TLS SNI extension while routing the HTTP request to a different origin via the `Host` header. This makes it difficult for network observers to determine the true destination of traffic.
 
+**Important:** This library is not a general-purpose HTTP client. It only works for origin hosts that have been **explicitly mapped** in the configuration. Each origin you want to reach (e.g. `config.example.com`) must have a corresponding CDN distribution set up to proxy traffic to it, and that mapping must be listed in the provider's `hostaliases`. If you try to send a request to an unmapped host, the library will return an error — it cannot front arbitrary destinations.
+
 ## Features
 
 - **No global state** — all state lives on `*Client`; safe to run multiple instances
@@ -73,7 +75,11 @@ func main() {
 
 ## Configuration
 
-The library accepts the same `fronted.yaml.gz` format used by [getlantern/fronted](https://github.com/getlantern/fronted):
+The library accepts the same `fronted.yaml.gz` format used by [getlantern/fronted](https://github.com/getlantern/fronted). The key concept is the **provider**, which represents a CDN (CloudFront, Akamai, etc.) through which traffic is tunneled. Each provider declares:
+
+- **`hostaliases`** — the mapping from origin hostnames you want to reach to CDN distribution hostnames that proxy to them. You must set up each CDN distribution separately to forward traffic to your origin, then list the mapping here. Only origins listed in `hostaliases` (or matching a `passthrupatterns` wildcard) can be reached through the library.
+- **`masquerades`** — CDN edge IPs and domains to connect to. These are the actual TLS endpoints the library dials.
+- **`testurl`** — a URL used to vet whether a masquerade is working (should return 202 on POST).
 
 ```yaml
 trustedcas:
