@@ -52,10 +52,17 @@ type Masquerade struct {
 // Lookup returns the fronted hostname for the given origin hostname.
 // Returns empty string if the provider has no mapping for the host.
 func (p *Provider) Lookup(hostname string) string {
-	if h, _, err := net.SplitHostPort(hostname); err == nil {
-		hostname = h
+	// Strip port if present. Check for colon first to avoid net.SplitHostPort
+	// which allocates a *AddrError for port-less hostnames (the common case).
+	if strings.LastIndexByte(hostname, ':') >= 0 {
+		if h, _, err := net.SplitHostPort(hostname); err == nil {
+			hostname = h
+		}
 	}
-	hostname = strings.ToLower(hostname)
+	// Only allocate a lowercase copy when the hostname isn't already lowercase.
+	// In practice, hostnames from Android/Go HTTP clients are almost always
+	// lowercase, so this avoids an allocation on the hot request path.
+	hostname = toLowerFast(hostname)
 
 	if alias := p.HostAliases[hostname]; alias != "" {
 		return alias
@@ -69,6 +76,16 @@ func (p *Provider) Lookup(hostname string) string {
 		}
 	}
 	return ""
+}
+
+// toLowerFast returns s lowercased, reusing s if it's already all-lowercase.
+func toLowerFast(s string) string {
+	for i := range s {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return strings.ToLower(s)
+		}
+	}
+	return s
 }
 
 // ParseConfig parses a gzipped YAML configuration into a Config.

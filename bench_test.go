@@ -9,7 +9,7 @@ import (
 )
 
 func BenchmarkFrontPoolTakeReturn(b *testing.B) {
-	pool := newFrontPool()
+	pool := newFrontPool(0)
 	f := newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}, "test")
 	f.markSucceeded()
 	pool.addReady(f)
@@ -23,7 +23,7 @@ func BenchmarkFrontPoolTakeReturn(b *testing.B) {
 }
 
 func BenchmarkFrontPoolCandidates(b *testing.B) {
-	pool := newFrontPool()
+	pool := newFrontPool(0)
 	fronts := make([]*front, 5000)
 	for i := range fronts {
 		fronts[i] = newFront(&Masquerade{
@@ -47,7 +47,7 @@ func BenchmarkRewriteRequest(b *testing.B) {
 	req.Header.Set("X-Custom", "value")
 	b.ResetTimer()
 	for b.Loop() {
-		_, _ = rewriteRequest(req, "d1234.cloudfront.net", nil)
+		_ = rewriteRequest(req, "d1234.cloudfront.net", nil)
 	}
 }
 
@@ -115,6 +115,22 @@ func BenchmarkFrontsToCache(b *testing.B) {
 	for i := range fronts {
 		fronts[i] = newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}, "test")
 		fronts[i].markSucceeded()
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		_ = frontsToCache(fronts, 1000)
+	}
+}
+
+// BenchmarkFrontsToCacheRealistic simulates a typical pool where only ~10%
+// of fronts have been tested and succeeded — the common case on mobile.
+func BenchmarkFrontsToCacheRealistic(b *testing.B) {
+	fronts := make([]*front, 1000)
+	for i := range fronts {
+		fronts[i] = newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}, "test")
+		if i < 100 { // only 10% succeeded
+			fronts[i].markSucceeded()
+		}
 	}
 	b.ResetTimer()
 	for b.Loop() {

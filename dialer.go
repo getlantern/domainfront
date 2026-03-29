@@ -36,29 +36,11 @@ type dialResult struct {
 }
 
 // dialFront performs a TLS connection to the given front.
+// Builds the tls.Config in a single allocation (no Clone).
 func dialFront(ctx context.Context, f *front, rootCAs *x509.CertPool, clientHelloID tls.ClientHelloID, dialer Dialer) dialResult {
 	addr := f.IpAddress
 	if _, _, err := net.SplitHostPort(addr); err != nil {
 		addr = net.JoinHostPort(addr, "443")
-	}
-
-	tlsConfig := &tls.Config{
-		ServerName: f.Domain,
-		RootCAs:    rootCAs,
-	}
-
-	var sendServerNameExtension bool
-	if f.SNI != "" {
-		sendServerNameExtension = true
-		tlsConfig.ServerName = f.SNI
-		tlsConfig.InsecureSkipVerify = true
-		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			var verifyHostname string
-			if f.VerifyHostname != nil {
-				verifyHostname = *f.VerifyHostname
-			}
-			return verifyPeerCertificate(rawCerts, rootCAs, verifyHostname)
-		}
 	}
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
@@ -69,18 +51,31 @@ func dialFront(ctx context.Context, f *front, rootCAs *x509.CertPool, clientHell
 		return dialResult{nil, classifyError(err), err}
 	}
 
-	configCopy := tlsConfig.Clone()
-	configCopy.InsecureSkipVerify = true
-	if !sendServerNameExtension {
-		configCopy.ServerName = ""
+	// Build final tls.Config directly — single allocation instead of alloc + Clone.
+	config := &tls.Config{
+		RootCAs:            rootCAs,
+		InsecureSkipVerify: true,
 	}
+
+	useSNI := f.SNI != ""
+	if useSNI {
+		config.ServerName = f.SNI
+		config.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			var verifyHostname string
+			if f.VerifyHostname != nil {
+				verifyHostname = *f.VerifyHostname
+			}
+			return verifyPeerCertificate(rawCerts, rootCAs, verifyHostname)
+		}
+	}
+	// When not using SNI, ServerName stays empty so no SNI extension is sent.
 
 	chid := clientHelloID
 	if chid.Client == "" {
 		chid = tls.HelloGolang
 	}
 
-	conn := tls.UClient(rawConn, configCopy, chid)
+	conn := tls.UClient(rawConn, config, chid)
 	deadline := time.Now().Add(dialTimeout)
 	rawConn.SetDeadline(deadline)
 
@@ -91,13 +86,13 @@ func dialFront(ctx context.Context, f *front, rootCAs *x509.CertPool, clientHell
 	rawConn.SetDeadline(time.Time{})
 
 	// For non-SNI case, verify the cert manually after handshake
-	if !tlsConfig.InsecureSkipVerify {
+	if !useSNI {
 		state := conn.ConnectionState()
 		rawCerts := make([][]byte, len(state.PeerCertificates))
 		for i, cert := range state.PeerCertificates {
 			rawCerts[i] = cert.Raw
 		}
-		if err := verifyPeerCertificate(rawCerts, tlsConfig.RootCAs, tlsConfig.ServerName); err != nil {
+		if err := verifyPeerCertificate(rawCerts, rootCAs, f.Domain); err != nil {
 			rawConn.Close()
 			return dialResult{nil, false, err}
 		}
