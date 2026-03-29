@@ -80,7 +80,7 @@ func WithClientHelloID(id tls.ClientHelloID) Option {
 func WithCrawlerConcurrency(n int) Option { return func(c *Client) { c.crawlerConcurrency = n } }
 
 // WithReadyQueueSize sets the capacity of the ready-fronts channel.
-// Smaller values save memory on constrained devices. Default is 4000.
+// Smaller values save memory on constrained devices. Default is 500.
 func WithReadyQueueSize(n int) Option { return func(c *Client) { c.readyQueueSize = n } }
 
 // WithCacheSaveInterval sets how often dirty cache state is flushed to disk.
@@ -246,7 +246,11 @@ func (c *Client) crawler() {
 	// Use a reusable timer instead of time.After to avoid leaking timers.
 	// time.After creates a new timer each iteration that isn't GC'd until it
 	// fires — on memory-constrained devices this creates mounting GC pressure.
+	// Initialize stopped and drain to avoid an immediate spurious wake.
 	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
 	defer timer.Stop()
 
 	for {

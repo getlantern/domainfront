@@ -143,11 +143,13 @@ func rewriteRequest(req *http.Request, frontedHost string, body io.ReadCloser) *
 		Header:        make(http.Header, len(req.Header)),
 	}).WithContext(req.Context())
 
-	// Share header value slices instead of copying them. This is safe because
-	// the original request's headers aren't modified during the round trip.
+	// Clone header value slices to decouple from the caller's request.
+	// Sharing slices can cause data races if the original request is reused.
 	for k, vs := range req.Header {
 		if !strings.EqualFold(k, "Host") {
-			r.Header[k] = vs
+			cp := make([]string, len(vs))
+			copy(cp, vs)
+			r.Header[k] = cp
 		}
 	}
 	return r
