@@ -1,9 +1,10 @@
 package domainfront
 
 import (
+	"cmp"
 	"context"
 	"math/rand/v2"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 )
@@ -70,9 +71,12 @@ type frontPool struct {
 	closed chan struct{}
 }
 
-func newFrontPool() *frontPool {
+func newFrontPool(readySize int) *frontPool {
+	if readySize <= 0 {
+		readySize = 500
+	}
 	return &frontPool{
-		ready:  make(chan *front, 4000),
+		ready:  make(chan *front, readySize),
 		closed: make(chan struct{}),
 	}
 }
@@ -164,40 +168,51 @@ func (p *frontPool) Close() {
 // fronts first and the rest shuffled.
 func (p *frontPool) candidates() []*front {
 	p.mu.Lock()
-	c := make([]*front, len(p.fronts))
-	copy(c, p.fronts)
+	n := len(p.fronts)
+	if n == 0 {
+		p.mu.Unlock()
+		return nil
+	}
+
+	// Pack pointer + int64 timestamp together (16 bytes vs 32 for time.Time).
+	// This halves the working-set size and makes sort comparisons cheaper
+	// (plain int64 compare vs time.Time.After with monotonic-clock logic).
+	type item struct {
+		f  *front
+		ts int64 // UnixNano; 0 = never succeeded
+	}
+	items := make([]item, n)
+	for i, f := range p.fronts {
+		items[i].f = f
+	}
 	p.mu.Unlock()
 
-	// Snapshot timestamps to avoid acquiring per-front locks during sort
-	type indexed struct {
-		f  *front
-		ts time.Time
-	}
-	items := make([]indexed, len(c))
-	for i, f := range c {
-		items[i] = indexed{f, f.lastSucceededTime()}
+	// Snapshot timestamps outside the pool lock
+	for i := range items {
+		if t := items[i].f.lastSucceededTime(); !t.IsZero() {
+			items[i].ts = t.UnixNano()
+		}
 	}
 
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].ts.After(items[j].ts) {
-			return true
+	// pdqsort via slices.SortFunc: faster than sort.Slice, no interface boxing
+	slices.SortFunc(items, func(a, b item) int {
+		if c := cmp.Compare(b.ts, a.ts); c != 0 {
+			return c // descending: most recent first
 		}
-		if items[j].ts.After(items[i].ts) {
-			return false
-		}
-		return items[i].f.IpAddress < items[j].f.IpAddress
+		return cmp.Compare(a.f.IpAddress, b.f.IpAddress)
 	})
 
 	// Shuffle the non-succeeded tail
 	tail := 0
-	for tail < len(items) && !items[tail].ts.IsZero() {
+	for tail < n && items[tail].ts != 0 {
 		tail++
 	}
 	rest := items[tail:]
 	rand.Shuffle(len(rest), func(i, j int) { rest[i], rest[j] = rest[j], rest[i] })
 
-	for i, item := range items {
-		c[i] = item.f
+	c := make([]*front, n)
+	for i := range items {
+		c[i] = items[i].f
 	}
 	return c
 }

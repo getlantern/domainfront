@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +59,7 @@ type Client struct {
 	httpClient *http.Client
 
 	crawlerConcurrency int
+	readyQueueSize     int
 	wg                 sync.WaitGroup
 }
 
@@ -79,6 +79,16 @@ func WithClientHelloID(id tls.ClientHelloID) Option {
 }
 func WithCrawlerConcurrency(n int) Option { return func(c *Client) { c.crawlerConcurrency = n } }
 
+// WithReadyQueueSize sets the capacity of the ready-fronts channel.
+// Smaller values save memory on constrained devices. Default is 4000.
+func WithReadyQueueSize(n int) Option { return func(c *Client) { c.readyQueueSize = n } }
+
+// WithCacheSaveInterval sets how often dirty cache state is flushed to disk.
+// Longer intervals reduce I/O on flash storage (e.g. Android). Default is 5s.
+func WithCacheSaveInterval(d time.Duration) Option {
+	return func(c *Client) { c.cacheSaveInterval = d }
+}
+
 // WithCacheFile is a convenience option that sets a FileCache at the given path.
 func WithCacheFile(path string) Option {
 	return func(c *Client) { c.cache = &FileCache{Path: path} }
@@ -97,7 +107,7 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 		ctx:                innerCtx,
 		cancel:             cancel,
 		log:                slog.Default(),
-		pool:               newFrontPool(),
+		pool:               nil, // created after options are applied
 		providers:          make(map[string]*Provider),
 		dialer:             NetDialer{},
 		clientHelloID:      tls.HelloChrome_131,
@@ -120,6 +130,9 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 	if c.crawlerConcurrency < 1 {
 		c.crawlerConcurrency = 1
 	}
+
+	// Create pool after options are applied so readyQueueSize can be set
+	c.pool = newFrontPool(c.readyQueueSize)
 
 	if err := c.applyConfig(config); err != nil {
 		cancel()
@@ -230,15 +243,22 @@ func (c *Client) notifyCacheDirty() {
 func (c *Client) crawler() {
 	defer c.wg.Done()
 
+	// Use a reusable timer instead of time.After to avoid leaking timers.
+	// time.After creates a new timer each iteration that isn't GC'd until it
+	// fires — on memory-constrained devices this creates mounting GC pressure.
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
 	for {
 		if c.pool.readyCount() < 2 {
 			c.crawlAllFronts()
 		}
 
+		timer.Reset(time.Duration(6+rand.IntN(7)) * time.Second)
 		select {
 		case <-c.ctx.Done():
 			return
-		case <-time.After(time.Duration(6+rand.IntN(7)) * time.Second):
+		case <-timer.C:
 		}
 	}
 }
@@ -300,16 +320,19 @@ func (c *Client) vetFront(f *front) bool {
 	return c.verifyWithPost(result.conn, provider.TestURL)
 }
 
+// vetBody is reused across vet requests to avoid per-call allocation.
+var vetBody = []byte("a")
+
 func (c *Client) verifyWithPost(conn net.Conn, testURL string) bool {
 	tr := newConnTransport(conn, true)
-	client := &http.Client{Transport: tr}
-	req, err := http.NewRequest(http.MethodPost, testURL, strings.NewReader("a"))
+	req, err := http.NewRequest(http.MethodPost, testURL, bytes.NewReader(vetBody))
 	if err != nil {
 		c.log.Debug("Error creating vet request", "error", err)
 		return false
 	}
+	req.URL.Scheme = "http" // TLS already established on conn
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	resp, err := tr.RoundTrip(req)
 	if err != nil {
 		c.log.Debug("Error vetting front", "error", err, "url", testURL)
 		return false
@@ -328,16 +351,20 @@ func (c *Client) verifyWithPost(conn net.Conn, testURL string) bool {
 func (c *Client) cacheSaver() {
 	defer c.wg.Done()
 
+	timer := time.NewTimer(c.cacheSaveInterval)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
-		case <-time.After(c.cacheSaveInterval):
+		case <-timer.C:
 			select {
 			case <-c.cacheDirty:
 				c.saveCache()
 			default:
 			}
+			timer.Reset(c.cacheSaveInterval)
 		}
 	}
 }

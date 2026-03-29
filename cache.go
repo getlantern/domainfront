@@ -53,18 +53,24 @@ func (NopCache) Load() ([]*CachedFront, error) { return nil, nil }
 func (NopCache) Save([]*CachedFront) error      { return nil }
 
 // frontsToCache converts pool fronts to cache format, limited to maxSize entries.
+// Only fronts that have previously succeeded are cached — this avoids allocating
+// CachedFront structs for the (typically much larger) set of untested fronts.
 func frontsToCache(fronts []*front, maxSize int) []*CachedFront {
-	if len(fronts) > maxSize {
-		fronts = fronts[:maxSize]
-	}
-	cached := make([]*CachedFront, 0, len(fronts))
+	cached := make([]*CachedFront, 0, min(len(fronts), maxSize))
 	for _, f := range fronts {
+		ts := f.lastSucceededTime()
+		if ts.IsZero() {
+			continue // never succeeded, skip
+		}
+		if len(cached) >= maxSize {
+			break
+		}
 		cached = append(cached, &CachedFront{
 			Domain:         f.Domain,
 			IpAddress:      f.IpAddress,
 			SNI:            f.SNI,
 			VerifyHostname: f.VerifyHostname,
-			LastSucceeded:  f.lastSucceededTime(),
+			LastSucceeded:  ts,
 			ProviderID:     f.ProviderID,
 		})
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 func TestFrontPool_TakeReturn(t *testing.T) {
-	pool := newFrontPool()
+	pool := newFrontPool(0)
 	f := newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}, "test")
 	f.markSucceeded()
 
@@ -30,7 +30,7 @@ func TestFrontPool_TakeReturn(t *testing.T) {
 }
 
 func TestFrontPool_ReturnRequeue(t *testing.T) {
-	pool := newFrontPool()
+	pool := newFrontPool(0)
 	f := newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}, "test")
 	pool.addReady(f)
 
@@ -45,7 +45,7 @@ func TestFrontPool_ReturnRequeue(t *testing.T) {
 }
 
 func TestFrontPool_TakeBlocksUntilReady(t *testing.T) {
-	pool := newFrontPool()
+	pool := newFrontPool(0)
 	f := newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}, "test")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -70,7 +70,7 @@ func TestFrontPool_TakeBlocksUntilReady(t *testing.T) {
 }
 
 func TestFrontPool_Replace_PreservesState(t *testing.T) {
-	pool := newFrontPool()
+	pool := newFrontPool(0)
 	f1 := newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}, "test")
 	f1.markSucceeded()
 	pool.Replace([]*front{f1})
@@ -83,7 +83,7 @@ func TestFrontPool_Replace_PreservesState(t *testing.T) {
 }
 
 func TestFrontPool_Close(t *testing.T) {
-	pool := newFrontPool()
+	pool := newFrontPool(0)
 
 	ctx := context.Background()
 	go func() {
@@ -96,7 +96,7 @@ func TestFrontPool_Close(t *testing.T) {
 }
 
 func TestFrontPool_Candidates(t *testing.T) {
-	pool := newFrontPool()
+	pool := newFrontPool(0)
 
 	f1 := newFront(&Masquerade{Domain: "a.com", IpAddress: "1.1.1.1"}, "p1")
 	f2 := newFront(&Masquerade{Domain: "b.com", IpAddress: "2.2.2.2"}, "p2")

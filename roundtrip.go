@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -83,10 +82,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost string, body io.ReadCloser) (*http.Response, error) {
-	fronted, err := rewriteRequest(req, frontedHost, body)
-	if err != nil {
-		return nil, err
-	}
+	fronted := rewriteRequest(req, frontedHost, body)
 
 	disableKeepAlives := true
 	if strings.EqualFold(req.Header.Get("Connection"), "upgrade") {
@@ -109,50 +105,52 @@ func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost 
 }
 
 // newConnTransport creates an http.RoundTripper that sends requests over a
-// pre-established connection, rewriting https:// to http://.
+// pre-established connection. The request URL scheme must already be "http"
+// (set by rewriteRequest) since TLS is already established.
 func newConnTransport(conn net.Conn, disableKeepAlives bool) http.RoundTripper {
-	return &schemeRewriter{
-		Transport: http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				return conn, nil
-			},
-			TLSHandshakeTimeout: 20 * time.Second,
-			DisableKeepAlives:   disableKeepAlives,
-			IdleConnTimeout:     70 * time.Second,
+	return &http.Transport{
+		Dial: func(network, addr string) (net.Conn, error) {
+			return conn, nil
 		},
+		TLSHandshakeTimeout: 20 * time.Second,
+		DisableKeepAlives:   disableKeepAlives,
+		IdleConnTimeout:     70 * time.Second,
 	}
 }
 
-// schemeRewriter rewrites https:// to http:// since TLS is already established.
-type schemeRewriter struct {
-	http.Transport
-}
+// rewriteRequest creates a domain-fronted copy of req.
+// It builds the URL directly (no string→parse round-trip) and shares header
+// value slices with the original request to avoid per-header allocations.
+// The scheme is set to "http" since TLS is already established on the
+// underlying connection, eliminating the need for a separate schemeRewriter.
+func rewriteRequest(req *http.Request, frontedHost string, body io.ReadCloser) *http.Request {
+	// Shallow-copy the URL, override host and scheme.
+	u := *req.URL
+	u.Host = frontedHost
+	u.Scheme = "http" // TLS already established; avoids double-wrap
 
-func (sr *schemeRewriter) RoundTrip(req *http.Request) (*http.Response, error) {
-	norm := new(http.Request)
-	*norm = *req
-	norm.URL = new(url.URL)
-	*norm.URL = *req.URL
-	norm.URL.Scheme = "http"
-	return sr.Transport.RoundTrip(norm)
-}
+	// Build the request struct, then attach the caller's context.
+	// WithContext returns a shallow copy with the context set — this is the
+	// only way to set the unexported ctx field on http.Request.
+	r := (&http.Request{
+		Method:        req.Method,
+		URL:           &u,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Body:          body,
+		ContentLength: req.ContentLength,
+		Header:        make(http.Header, len(req.Header)),
+	}).WithContext(req.Context())
 
-func rewriteRequest(req *http.Request, frontedHost string, body io.ReadCloser) (*http.Request, error) {
-	urlCopy := *req.URL
-	urlCopy.Host = frontedHost
-	r, err := http.NewRequestWithContext(req.Context(), req.Method, urlCopy.String(), body)
-	if err != nil {
-		return nil, err
-	}
-	r.ContentLength = req.ContentLength
+	// Share header value slices instead of copying them. This is safe because
+	// the original request's headers aren't modified during the round trip.
 	for k, vs := range req.Header {
 		if !strings.EqualFold(k, "Host") {
-			v := make([]string, len(vs))
-			copy(v, vs)
-			r.Header[k] = v
+			r.Header[k] = vs
 		}
 	}
-	return r, nil
+	return r
 }
 
 // getBodyFactory returns a function that produces a fresh body reader for each

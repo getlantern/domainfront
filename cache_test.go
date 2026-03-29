@@ -74,9 +74,20 @@ func TestFrontsToCache(t *testing.T) {
 		newFront(&Masquerade{Domain: "b.com", IpAddress: "2.2.2.2"}, "p2"),
 		newFront(&Masquerade{Domain: "c.com", IpAddress: "3.3.3.3"}, "p3"),
 	}
+	// Mark all as succeeded — only succeeded fronts are cached
+	for _, f := range fronts {
+		f.markSucceeded()
+	}
 
 	cached := frontsToCache(fronts, 2)
-	assert.Len(t, cached, 2)
+	assert.Len(t, cached, 2, "should be limited to maxSize")
+
+	// Verify that never-succeeded fronts are skipped
+	unsucceeded := []*front{
+		newFront(&Masquerade{Domain: "d.com", IpAddress: "4.4.4.4"}, "p4"),
+	}
+	cached = frontsToCache(unsucceeded, 10)
+	assert.Len(t, cached, 0, "never-succeeded fronts should not be cached")
 }
 
 func TestFileCache_CreatesDirs(t *testing.T) {
