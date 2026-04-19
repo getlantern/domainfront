@@ -192,7 +192,8 @@ func TestIntegration_NewConnectedRoundTripper(t *testing.T) {
 	require.NoError(t, err, "round trip on pre-connected RT should succeed")
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err, "reading response body should succeed")
 	t.Logf("Response: status=%d bodyLen=%d", resp.StatusCode, len(body))
 	assert.Less(t, resp.StatusCode, 500)
 	assert.NotEqual(t, 400, resp.StatusCode)
