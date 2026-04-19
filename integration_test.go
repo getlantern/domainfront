@@ -163,3 +163,39 @@ func TestIntegration_CachePersistence(t *testing.T) {
 	elapsed := time.Since(start)
 	t.Logf("Second startup with cache: %v to first working front", elapsed)
 }
+
+// TestIntegration_NewConnectedRoundTripper verifies that NewConnectedRoundTripper
+// blocks until a front is actually dialed (TLS handshake complete) and that
+// the returned one-shot RoundTripper can satisfy a real domain-fronted request.
+func TestIntegration_NewConnectedRoundTripper(t *testing.T) {
+	cfg := loadEmbeddedConfig(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	client, err := New(ctx, cfg,
+		WithCacheFile(filepath.Join(t.TempDir(), "cache.json")),
+		WithDefaultProviderID("cloudfront"),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	rt, err := client.NewConnectedRoundTripper(ctx, "")
+	require.NoError(t, err, "NewConnectedRoundTripper should block until a front is dialed")
+	require.NotNil(t, rt)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://borda.lantern.io/ping", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err, "round trip on pre-connected RT should succeed")
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err, "reading response body should succeed")
+	t.Logf("Response: status=%d bodyLen=%d", resp.StatusCode, len(body))
+	assert.Less(t, resp.StatusCode, 500)
+	assert.NotEqual(t, 400, resp.StatusCode)
+	assert.NotEqual(t, 403, resp.StatusCode)
+}
