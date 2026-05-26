@@ -103,12 +103,12 @@ providers:
     hostaliases:
       api.example.com: api.dsa.akamai.example.com
     testurl: https://fronted-ping.dsa.akamai.example.com/ping
-    fronting_snis:
+    frontingsnis:
       default:
-        use_arbitrary_snis: false
+        usearbitrarysnis: false
       br:
-        use_arbitrary_snis: true
-        arbitrary_snis:
+        usearbitrarysnis: true
+        arbitrarysnis:
           - mercadopago.com
           - amazon.com.br
     masquerades:

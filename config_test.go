@@ -76,6 +76,10 @@ func TestExpandedProvider(t *testing.T) {
 }
 
 func TestParseConfigYAML(t *testing.T) {
+	// Keys are the lowercase-concatenated form the upstream generator
+	// emits (frontingsnis / usearbitrarysnis / arbitrarysnis), NOT
+	// snake_case — a tag-spelling mismatch silently parses these as zero
+	// values, so this fixture guards against that regressing.
 	yml := `
 trustedcas:
   - commonname: "Test CA"
@@ -88,6 +92,14 @@ providers:
     hostaliases:
       example.com: cdn.example.com
     testurl: https://test.example.com/ping
+    frontingsnis:
+      default:
+        usearbitrarysnis: false
+      ir:
+        usearbitrarysnis: true
+        arbitrarysnis:
+          - python.org
+          - snapp.ir
     masquerades:
       - domain: cdn.example.com
         ipaddress: "1.2.3.4"
@@ -101,4 +113,11 @@ providers:
 	assert.Equal(t, "cdn.example.com", p.HostAliases["example.com"])
 	require.Len(t, p.Masquerades, 1)
 	assert.Equal(t, "1.2.3.4", p.Masquerades[0].IpAddress)
+
+	require.Contains(t, p.FrontingSNIs, "default")
+	require.Contains(t, p.FrontingSNIs, "ir")
+	assert.False(t, p.FrontingSNIs["default"].UseArbitrarySNIs)
+	ir := p.FrontingSNIs["ir"]
+	assert.True(t, ir.UseArbitrarySNIs)
+	assert.Equal(t, []string{"python.org", "snapp.ir"}, ir.ArbitrarySNIs)
 }
