@@ -32,13 +32,18 @@ type Provider struct {
 	TestURL             string               `yaml:"testurl"`
 	Masquerades         []*Masquerade        `yaml:"masquerades"`
 	VerifyHostname      *string              `yaml:"verifyhostname"`
-	FrontingSNIs        map[string]*SNIConfig `yaml:"fronting_snis"`
+	// Pipeline-emitted YAML keys are lowercase-concatenated, not
+	// snake_case (the upstream generator uses lowercased Go field
+	// names with no yaml tag); the tag here must match the wire
+	// format exactly or yaml.Unmarshal silently leaves the field
+	// zero-valued.
+	FrontingSNIs map[string]*SNIConfig `yaml:"frontingsnis"`
 }
 
 // SNIConfig controls SNI generation for a specific country or "default".
 type SNIConfig struct {
-	UseArbitrarySNIs bool     `yaml:"use_arbitrary_snis"`
-	ArbitrarySNIs    []string `yaml:"arbitrary_snis"`
+	UseArbitrarySNIs bool     `yaml:"usearbitrarysnis"`
+	ArbitrarySNIs    []string `yaml:"arbitrarysnis"`
 }
 
 // Masquerade contains the data for a single domain front.
