@@ -1,11 +1,12 @@
 # Alibaba Cloud (Aliyun) CDN domain-fronting provider.
 #
 # Built & verified 2026-06-23 (US vantage point). Aliyun CDN edges route by the
-# HTTP Host header and ignore the TLS SNI for origin selection, so a censor doing
-# SNI filtering sees only the innocent front domain (img.alicdn.com) while the
-# request reaches the real target. Confirmed cross-organization: a TLS session
-# bearing Alibaba's *.tbcdn.cn cert (SNI img.alicdn.com) reached Bilibili
-# (s1.hdslb.com) and Momo (img.momocdn.com) origins purely via the Host header.
+# HTTP Host header (h1) / :authority (h2) and ignore the TLS SNI for origin
+# selection, so a censor doing SNI filtering sees only the innocent front domain
+# (img.alicdn.com) while the request reaches the real target. Confirmed
+# cross-organization: a TLS session bearing Alibaba's *.tbcdn.cn cert (SNI
+# img.alicdn.com) reached Bilibili (s1.hdslb.com) and Momo (img.momocdn.com)
+# origins purely via the Host header.
 #
 # Two operational constraints discovered:
 #   1. TLS layer — the edge node must hold a cert valid for the SNI you present.
@@ -60,12 +61,20 @@ providers:
         # testurl must resolve to an Aliyun-onboarded host that returns HTTP 202
         # on POST (see verifyWithPost). Point this at your distribution's /ping.
         testurl: https://REPLACE-ME.w.kunlunaq.com/ping
+        # Pin TLS verification to a real Alibaba cert. Because SNI is set (see
+        # frontingsnis), dialFront takes the hostname-verifying path: without a
+        # verifyhostname it would be chain-only (any GlobalSign-R3-chained cert
+        # would pass). Every masquerade edge serves Alibaba's *.tbcdn.cn cert,
+        # whose SANs include *.alicdn.com, so this single value validates the
+        # leaf for all of the rotating frontingsnis (img/gw/a.alicdn.com).
+        # NOTE: ExpandedProvider applies this provider-level value to every
+        # masquerade; per-masquerade verifyhostname is NOT propagated.
+        verifyhostname: img.alicdn.com
         # frontingsnis drives the wire SNI. ExpandedProvider regenerates each
-        # masquerade's SNI from this list (deterministic by IP hash), so the
-        # per-masquerade `sni:` values below are placeholders and get overwritten.
-        # NOTE: a non-empty country code MUST be passed (WithCountryCode) for SNI
-        # to be emitted; otherwise the no-SNI fallback verifies the cert against
-        # the masquerade Domain (img.alicdn.com), which also works here.
+        # masquerade's SNI from this list (deterministic by IP hash). A non-empty
+        # country code MUST be passed (WithCountryCode) for SNI to be emitted;
+        # otherwise the no-SNI fallback verifies the cert against the masquerade
+        # Domain (img.alicdn.com), which also works here.
         frontingsnis:
             default:
                 usearbitrarysnis: true
@@ -74,30 +83,21 @@ providers:
                     - gw.alicdn.com
                     - a.alicdn.com
         # Masquerades: Aliyun edge IPs verified 2026-06-23 to present the Alibaba
-        # *.tbcdn.cn cert. The upstream pipeline should harvest a much larger pool
-        # from in-region vantage points; this is a seed set across 3 /24 blocks.
+        # *.tbcdn.cn cert. Each entry is just domain + ipaddress — SNI comes from
+        # frontingsnis and the verify hostname from the provider-level
+        # verifyhostname above (per-masquerade sni/verifyhostname are ignored by
+        # ExpandedProvider). The upstream pipeline should harvest a much larger
+        # pool from in-region vantage points; this is a seed set across 3 /24s.
         masquerades:
             - domain: img.alicdn.com
               ipaddress: 155.102.54.137
-              sni: ""
-              verifyhostname: null
             - domain: img.alicdn.com
               ipaddress: 155.102.54.138
-              sni: ""
-              verifyhostname: null
             - domain: img.alicdn.com
               ipaddress: 163.181.66.200
-              sni: ""
-              verifyhostname: null
             - domain: img.alicdn.com
               ipaddress: 163.181.66.201
-              sni: ""
-              verifyhostname: null
             - domain: img.alicdn.com
               ipaddress: 8.25.82.183
-              sni: ""
-              verifyhostname: null
             - domain: img.alicdn.com
               ipaddress: 8.25.82.184
-              sni: ""
-              verifyhostname: null

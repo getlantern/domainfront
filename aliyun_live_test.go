@@ -40,6 +40,7 @@ func TestAliyunProviderLive(t *testing.T) {
 
 	// Expand with a country code so FrontingSNIs drives the wire SNI
 	// (config.go only emits SNI when countryCode != "").
+	require.Contains(t, cfg.Providers, "aliyun", "aliyun-provider.yaml must define the 'aliyun' provider")
 	p := ExpandedProvider(cfg.Providers["aliyun"], "cn")
 	require.NotEmpty(t, p.Masquerades)
 
