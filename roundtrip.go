@@ -167,10 +167,11 @@ func roundTripH2(conn net.Conn, req *http.Request) (*http.Response, error) {
 }
 
 // h2Body closes the underlying HTTP/2 connection when the response body is
-// closed, since each connection serves exactly one request.
+// closed, since each connection serves exactly one request. cc is an io.Closer
+// (a *http2.ClientConn in practice) so the teardown logic stays unit-testable.
 type h2Body struct {
 	io.ReadCloser
-	cc   *http2.ClientConn
+	cc   io.Closer
 	once sync.Once
 }
 

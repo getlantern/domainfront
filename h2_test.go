@@ -3,6 +3,7 @@ package domainfront
 import (
 	stdtls "crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -102,6 +103,47 @@ func TestVerifyWithPost_HTTP2(t *testing.T) {
 	assert.True(t, ok, "a 202 over h2 should vet successfully")
 	assert.Equal(t, http.MethodPost, <-gotMethod)
 }
+
+// errCloser is a test io.Closer that records call count and returns a fixed err.
+type errCloser struct {
+	err   error
+	calls int
+}
+
+func (c *errCloser) Close() error { c.calls++; return c.err }
+
+// TestH2Body_Close covers the connection-teardown semantics: the underlying h2
+// connection is closed exactly once, its error surfaces when the body close
+// itself succeeds, and a body-close error takes precedence.
+func TestH2Body_Close(t *testing.T) {
+	t.Run("propagates cc error when body close ok", func(t *testing.T) {
+		cc := &errCloser{err: assert.AnError}
+		b := &h2Body{ReadCloser: io.NopCloser(nil), cc: cc}
+		assert.Equal(t, assert.AnError, b.Close())
+		assert.Equal(t, 1, cc.calls)
+	})
+
+	t.Run("body error takes precedence over cc error", func(t *testing.T) {
+		bodyErr := errors.New("body boom")
+		cc := &errCloser{err: assert.AnError}
+		b := &h2Body{ReadCloser: errReadCloser{bodyErr}, cc: cc}
+		assert.Equal(t, bodyErr, b.Close())
+		assert.Equal(t, 1, cc.calls, "cc still closed even when body close fails")
+	})
+
+	t.Run("closes the connection only once", func(t *testing.T) {
+		cc := &errCloser{}
+		b := &h2Body{ReadCloser: io.NopCloser(nil), cc: cc}
+		assert.NoError(t, b.Close())
+		assert.NoError(t, b.Close())
+		assert.Equal(t, 1, cc.calls)
+	})
+}
+
+type errReadCloser struct{ err error }
+
+func (e errReadCloser) Read([]byte) (int, error) { return 0, e.err }
+func (e errReadCloser) Close() error             { return e.err }
 
 func TestHasConnectionUpgrade(t *testing.T) {
 	mk := func(vals ...string) *http.Request {
