@@ -71,7 +71,8 @@ func TestAliyunProviderLive(t *testing.T) {
 		proto := negotiatedProtocol(res.conn)
 		t.Logf("TLS+verify OK: ip=%s sni=%s alpn=%s (cert chained to config's GlobalSign root)", m.IpAddress, m.SNI, proto)
 
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+crossOrgHost+"/", nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+crossOrgHost+"/", nil)
+		require.NoError(t, err)
 		resp, rerr := (&roundTripper{}).doRequest(req, res.conn, crossOrgHost, nil)
 		if rerr != nil {
 			res.conn.Close()
@@ -79,12 +80,14 @@ func TestAliyunProviderLive(t *testing.T) {
 			t.Logf("fronted GET via %s failed: %v", m.IpAddress, rerr)
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 256))
 		resp.Body.Close() // h2Body close tears down the conn
 		cancel()
-		t.Logf("fronted %s via %s (SNI %s, %s): HTTP %d, proto=HTTP/%d, body=%q",
-			crossOrgHost, m.IpAddress, m.SNI, proto, resp.StatusCode, resp.ProtoMajor, strings.TrimSpace(string(body)))
-		if resp.StatusCode == http.StatusOK {
+		t.Logf("fronted %s via %s (SNI %s, %s): HTTP %d, proto=HTTP/%d, body=%q (readErr=%v)",
+			crossOrgHost, m.IpAddress, m.SNI, proto, resp.StatusCode, resp.ProtoMajor, strings.TrimSpace(string(body)), readErr)
+		// Require a clean body read so a truncated/failed response can't be
+		// miscounted as a successful front.
+		if resp.StatusCode == http.StatusOK && readErr == nil {
 			frontedOK = true
 			// Only count it as proving the h2 path when ALPN actually
 			// negotiated h2 and the response came back as HTTP/2.
