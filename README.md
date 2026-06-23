@@ -13,10 +13,11 @@ A clean, production-grade domain fronting library for Go.
 - **Atomic config updates** — `FrontPool.Replace()` swaps the candidate set without unbounded growth, preserving state from previously-working fronts
 - **Smart round-trip** — checks provider host mapping *before* dialing TLS, avoiding wasted connections
 - **TLS fingerprinting** — uses [utls](https://github.com/refraction-networking/utls) to mimic real browser Client Hellos (Chrome 131 by default)
+- **HTTP/1.1 and HTTP/2** — the fronted request is framed to match whichever protocol the edge selects via ALPN, so the genuine browser ALPN (`h2,http/1.1`) can be offered without breaking against h2-only routing (CloudFront, Aliyun); routing works identically since the fronted host drives the `Host` header or the HTTP/2 `:authority` pseudo-header
 - **Country-aware SNI** — deterministic SNI selection from per-country lists, derived from IP hash
 - **Persistent caching** — working fronts are cached to disk (JSON) for fast startup
 - **Auto-updating config** — optionally fetches updated `fronted.yaml.gz` from a URL every 12 hours
-- **Minimal dependencies** — only `utls` and `go-yaml`; no worker pool libraries, no logging frameworks, no custom HTTP fetchers
+- **Minimal dependencies** — `utls`, `go-yaml`, and `x/net/http2`; no worker pool libraries, no logging frameworks, no custom HTTP fetchers
 - **Fully testable** — `Dialer` and `Cache` interfaces; unit tests use pipe-based mock TLS servers, no real CDN infrastructure required
 
 ## Installation

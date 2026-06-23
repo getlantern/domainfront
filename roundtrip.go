@@ -7,7 +7,11 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // roundTripper is an http.RoundTripper that sends requests via domain fronting.
@@ -84,13 +88,23 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost string, body io.ReadCloser) (*http.Response, error) {
 	fronted := rewriteRequest(req, frontedHost, body)
 
-	disableKeepAlives := true
-	if strings.EqualFold(req.Header.Get("Connection"), "upgrade") {
-		disableKeepAlives = false
+	var resp *http.Response
+	var err error
+	if negotiatedProtocol(conn) == "h2" {
+		// The edge selected HTTP/2 via ALPN (CloudFront and Aliyun both do
+		// under a real-browser ClientHello). Frame the request as h2 over the
+		// already-established conn. rewriteRequest set the scheme to "http" for
+		// the h1 transport's benefit; restore "https" so the :authority/:scheme
+		// pseudo-headers match what a browser sends over TLS.
+		fronted.URL.Scheme = "https"
+		resp, err = roundTripH2(conn, fronted)
+	} else {
+		disableKeepAlives := true
+		if strings.EqualFold(req.Header.Get("Connection"), "upgrade") {
+			disableKeepAlives = false
+		}
+		resp, err = newConnTransport(conn, disableKeepAlives).RoundTrip(fronted)
 	}
-
-	tr := newConnTransport(conn, disableKeepAlives)
-	resp, err := tr.RoundTrip(fronted)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +116,48 @@ func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost 
 	}
 
 	return resp, nil
+}
+
+// negotiatedProtocol reports the ALPN protocol settled during the TLS
+// handshake ("h2", "http/1.1", or "" when none was negotiated). In production
+// conn is always the utls client connection from dialFront.
+func negotiatedProtocol(conn net.Conn) string {
+	if c, ok := conn.(*utls.UConn); ok {
+		return c.ConnectionState().NegotiatedProtocol
+	}
+	return ""
+}
+
+// roundTripH2 sends req over conn using HTTP/2 framing. The library dials a
+// fresh connection per request and never reuses it, so the h2 ClientConn is
+// single-shot: closing the response body tears down the connection (and the
+// frame-reader goroutine) instead of leaving it for h2's idle pool.
+func roundTripH2(conn net.Conn, req *http.Request) (*http.Response, error) {
+	cc, err := (&http2.Transport{}).NewClientConn(conn)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cc.RoundTrip(req)
+	if err != nil {
+		cc.Close()
+		return nil, err
+	}
+	resp.Body = &h2Body{ReadCloser: resp.Body, cc: cc}
+	return resp, nil
+}
+
+// h2Body closes the underlying HTTP/2 connection when the response body is
+// closed, since each connection serves exactly one request.
+type h2Body struct {
+	io.ReadCloser
+	cc   *http2.ClientConn
+	once sync.Once
+}
+
+func (b *h2Body) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(func() { b.cc.Close() })
+	return err
 }
 
 // newConnTransport creates an http.RoundTripper that sends requests over a
