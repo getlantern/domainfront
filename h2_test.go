@@ -1,6 +1,7 @@
 package domainfront
 
 import (
+	"context"
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"testing"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/stretchr/testify/assert"
@@ -26,13 +28,19 @@ func dialPipeH2(t *testing.T, handler http.Handler) *utls.UConn {
 	roots := x509.NewCertPool()
 	roots.AddCert(ca)
 
+	// Bound both handshakes so a broken pairing fails fast on the deadline
+	// rather than hanging until the `go test` timeout. net.Pipe honors
+	// deadlines, so HandshakeContext can interrupt a stalled handshake.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	clientRaw, serverRaw := net.Pipe()
 	go func() {
 		srv := stdtls.Server(serverRaw, &stdtls.Config{
 			Certificates: []stdtls.Certificate{leaf},
 			NextProtos:   []string{"h2"},
 		})
-		if err := srv.Handshake(); err != nil {
+		if err := srv.HandshakeContext(ctx); err != nil {
 			serverRaw.Close()
 			return
 		}
@@ -44,7 +52,7 @@ func dialPipeH2(t *testing.T, handler http.Handler) *utls.UConn {
 		ServerName: "cdn.example.com",
 		NextProtos: []string{"h2"},
 	}, utls.HelloGolang)
-	require.NoError(t, uconn.Handshake())
+	require.NoError(t, uconn.HandshakeContext(ctx))
 	require.Equal(t, "h2", negotiatedProtocol(uconn), "handshake should negotiate h2")
 	return uconn
 }
