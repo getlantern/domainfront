@@ -31,8 +31,11 @@ func dialPipeH2(t *testing.T, handler http.Handler) *utls.UConn {
 	// Bound both handshakes so a broken pairing fails fast on the deadline
 	// rather than hanging until the `go test` timeout. net.Pipe honors
 	// deadlines, so HandshakeContext can interrupt a stalled handshake.
+	// Cancel at test end (not on return): the returned conn is used after this
+	// helper returns, and cancelling the handshake context while the conn is
+	// still in use poisons it (sets a past deadline) on some Go versions.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 
 	clientRaw, serverRaw := net.Pipe()
 	go func() {
