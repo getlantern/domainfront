@@ -14,8 +14,8 @@
 #      *.taobao.com, ...) is provisioned on ~every Aliyun node.
 #   2. The target Host must be an onboarded Aliyun CDN customer. A non-customer
 #      Host (e.g. www.example.com) makes the edge silently drop the connection.
-#      => Lantern must onboard its own distribution to Aliyun CDN; the
-#         hostaliases + testurl below are PLACEHOLDERS until that exists.
+#      => Lantern's own DCDN distributions (config/api/geo/update.dcdn.getiantem.org)
+#         are onboarded and the hostaliases below are validated end-to-end.
 #
 # This file is a complete, standalone Config (parseable via ParseConfigYAML) so
 # it can be loaded directly for testing. The `aliyun:` block under `providers:`
@@ -50,17 +50,24 @@ trustedcas:
 
 providers:
     aliyun:
-        # ----------------------------------------------------------------------
-        # PLACEHOLDER — replace with real Lantern origins mapped to the Aliyun CDN
-        # distribution domains (the CNAME targets, typically *.w.kunlunaq.com or a
-        # custom CNAME) you create when onboarding each origin to Aliyun CDN.
-        # ----------------------------------------------------------------------
+        # Origin -> Aliyun DCDN accelerated domain. The value is the *accelerated
+        # domain* (sent as the fronted Host), NOT the *.w.kunlungr.com edge CNAME:
+        # the edge vhosts on the accelerated domain (Host=CNAME returns 403).
+        # Each accelerated domain is an "overseas"-scope DCDN distribution whose
+        # origin is the raw iantem.io backend (api.iantem.io / update.iantem.io,
+        # bypassing Cloudflare) with back-to-origin SNI = that origin and
+        # back-to-origin Host = the service domain. Validated 2026-06-23: fronting
+        # each via img.alicdn.com returns byte-identical responses to the origin.
         hostaliases:
-            config.getiantem.org: replace-me.w.kunlunaq.com
-            api.getiantem.org: replace-me.w.kunlunaq.com
-        # testurl must resolve to an Aliyun-onboarded host that returns HTTP 202
-        # on POST (see verifyWithPost). Point this at your distribution's /ping.
-        testurl: https://replace-me.w.kunlunaq.com/ping
+            config.getiantem.org: config.dcdn.getiantem.org
+            api.getiantem.org: api.dcdn.getiantem.org
+            geo.getiantem.org: geo.dcdn.getiantem.org
+            update.getlantern.org: update.dcdn.getiantem.org
+        # testurl is POSTed through a vetted front (verifyWithPost expects 202).
+        # NOTE: the services above answer /ping with 404/301, not 202 — a
+        # dedicated 202 ping distribution (cf. Akamai's fronted-ping) should be
+        # added before relying on runtime vetting; this points at one for now.
+        testurl: https://config.dcdn.getiantem.org/ping
         # Pin TLS verification to a real Alibaba cert. Because SNI is set (see
         # frontingsnis), dialFront takes the hostname-verifying path: without a
         # verifyhostname it would be chain-only (any GlobalSign-R3-chained cert
