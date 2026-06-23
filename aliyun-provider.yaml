@@ -1,0 +1,103 @@
+# Alibaba Cloud (Aliyun) CDN domain-fronting provider.
+#
+# Built & verified 2026-06-23 (US vantage point). Aliyun CDN edges route by the
+# HTTP Host header and ignore the TLS SNI for origin selection, so a censor doing
+# SNI filtering sees only the innocent front domain (img.alicdn.com) while the
+# request reaches the real target. Confirmed cross-organization: a TLS session
+# bearing Alibaba's *.tbcdn.cn cert (SNI img.alicdn.com) reached Bilibili
+# (s1.hdslb.com) and Momo (img.momocdn.com) origins purely via the Host header.
+#
+# Two operational constraints discovered:
+#   1. TLS layer — the edge node must hold a cert valid for the SNI you present.
+#      img.alicdn.com is ideal: Alibaba's own *.tbcdn.cn cert (SAN *.alicdn.com,
+#      *.taobao.com, ...) is provisioned on ~every Aliyun node.
+#   2. The target Host must be an onboarded Aliyun CDN customer. A non-customer
+#      Host (e.g. www.example.com) makes the edge silently drop the connection.
+#      => Lantern must onboard its own distribution to Aliyun CDN; the
+#         hostaliases + testurl below are PLACEHOLDERS until that exists.
+#
+# This file is a complete, standalone Config (parseable via ParseConfigYAML) so
+# it can be loaded directly for testing. The `aliyun:` block under `providers:`
+# is what gets merged into the upstream getlantern/fronted pipeline output.
+
+trustedcas:
+    # Anchor for the Alibaba leaf cert chain:
+    #   *.tbcdn.cn -> GlobalSign GCC R3 OV TLS CA 2024 -> GlobalSign Root CA - R3
+    - commonname: GlobalSign Root CA - R3
+      cert: |
+        -----BEGIN CERTIFICATE-----
+        MIIDXzCCAkegAwIBAgILBAAAAAABIVhTCKIwDQYJKoZIhvcNAQELBQAwTDEgMB4G
+        A1UECxMXR2xvYmFsU2lnbiBSb290IENBIC0gUjMxEzARBgNVBAoTCkdsb2JhbFNp
+        Z24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMDkwMzE4MTAwMDAwWhcNMjkwMzE4
+        MTAwMDAwWjBMMSAwHgYDVQQLExdHbG9iYWxTaWduIFJvb3QgQ0EgLSBSMzETMBEG
+        A1UEChMKR2xvYmFsU2lnbjETMBEGA1UEAxMKR2xvYmFsU2lnbjCCASIwDQYJKoZI
+        hvcNAQEBBQADggEPADCCAQoCggEBAMwldpB5BngiFvXAg7aEyiie/QV2EcWtiHL8
+        RgJDx7KKnQRfJMsuS+FggkbhUqsMgUdwbN1k0ev1LKMPgj0MK66X17YUhhB5uzsT
+        gHeMCOFJ0mpiLx9e+pZo34knlTifBtc+ycsmWQ1z3rDI6SYOgxXG71uL0gRgykmm
+        KPZpO/bLyCiR5Z2KYVc3rHQU3HTgOu5yLy6c+9C7v/U9AOEGM+iCK65TpjoWc4zd
+        QQ4gOsC0p6Hpsk+QLjJg6VfLuQSSaGjlOCZgdbKfd/+RFO+uIEn8rUAVSNECMWEZ
+        XriX7613t2Saer9fwRPvm2L7DWzgVGkWqQPabumDk3F2xmmFghcCAwEAAaNCMEAw
+        DgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFI/wS3+o
+        LkUkrk1Q+mOai97i3Ru8MA0GCSqGSIb3DQEBCwUAA4IBAQBLQNvAUKr+yAzv95ZU
+        RUm7lgAJQayzE4aGKAczymvmdLm6AC2upArT9fHxD4q/c2dKg8dEe3jgr25sbwMp
+        jjM5RcOO5LlXbKr8EpbsU8Yt5CRsuZRj+9xTaGdWPoO4zzUhw8lo/s7awlOqzJCK
+        6fBdRoyV3XpYKBovHd7NADdBj+1EbddTKJd+82cEHhXXipa0095MJ6RMG3NzdvQX
+        mcIfeg7jLQitChws/zyrVQ4PkX4268NXSb7hLi18YIvDQVETI53O9zJrlAGomecs
+        Mx86OyXShkDOOyyGeMlhLxS67ttVb9+E7gUJTb0o2HLO02JQZR7rkpeDMdmztcpH
+        WD9f
+        -----END CERTIFICATE-----
+
+providers:
+    aliyun:
+        # ----------------------------------------------------------------------
+        # PLACEHOLDER — replace with real Lantern origins mapped to the Aliyun CDN
+        # distribution domains (the CNAME targets, typically *.w.kunlunaq.com or a
+        # custom CNAME) you create when onboarding each origin to Aliyun CDN.
+        # ----------------------------------------------------------------------
+        hostaliases:
+            config.getiantem.org: REPLACE-ME.w.kunlunaq.com
+            api.getiantem.org: REPLACE-ME.w.kunlunaq.com
+        # testurl must resolve to an Aliyun-onboarded host that returns HTTP 202
+        # on POST (see verifyWithPost). Point this at your distribution's /ping.
+        testurl: https://REPLACE-ME.w.kunlunaq.com/ping
+        # frontingsnis drives the wire SNI. ExpandedProvider regenerates each
+        # masquerade's SNI from this list (deterministic by IP hash), so the
+        # per-masquerade `sni:` values below are placeholders and get overwritten.
+        # NOTE: a non-empty country code MUST be passed (WithCountryCode) for SNI
+        # to be emitted; otherwise the no-SNI fallback verifies the cert against
+        # the masquerade Domain (img.alicdn.com), which also works here.
+        frontingsnis:
+            default:
+                usearbitrarysnis: true
+                arbitrarysnis:
+                    - img.alicdn.com
+                    - gw.alicdn.com
+                    - a.alicdn.com
+        # Masquerades: Aliyun edge IPs verified 2026-06-23 to present the Alibaba
+        # *.tbcdn.cn cert. The upstream pipeline should harvest a much larger pool
+        # from in-region vantage points; this is a seed set across 3 /24 blocks.
+        masquerades:
+            - domain: img.alicdn.com
+              ipaddress: 155.102.54.137
+              sni: ""
+              verifyhostname: null
+            - domain: img.alicdn.com
+              ipaddress: 155.102.54.138
+              sni: ""
+              verifyhostname: null
+            - domain: img.alicdn.com
+              ipaddress: 163.181.66.200
+              sni: ""
+              verifyhostname: null
+            - domain: img.alicdn.com
+              ipaddress: 163.181.66.201
+              sni: ""
+              verifyhostname: null
+            - domain: img.alicdn.com
+              ipaddress: 8.25.82.183
+              sni: ""
+              verifyhostname: null
+            - domain: img.alicdn.com
+              ipaddress: 8.25.82.184
+              sni: ""
+              verifyhostname: null
