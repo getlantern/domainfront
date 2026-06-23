@@ -56,11 +56,11 @@ providers:
         # custom CNAME) you create when onboarding each origin to Aliyun CDN.
         # ----------------------------------------------------------------------
         hostaliases:
-            config.getiantem.org: REPLACE-ME.w.kunlunaq.com
-            api.getiantem.org: REPLACE-ME.w.kunlunaq.com
+            config.getiantem.org: replace-me.w.kunlunaq.com
+            api.getiantem.org: replace-me.w.kunlunaq.com
         # testurl must resolve to an Aliyun-onboarded host that returns HTTP 202
         # on POST (see verifyWithPost). Point this at your distribution's /ping.
-        testurl: https://REPLACE-ME.w.kunlunaq.com/ping
+        testurl: https://replace-me.w.kunlunaq.com/ping
         # Pin TLS verification to a real Alibaba cert. Because SNI is set (see
         # frontingsnis), dialFront takes the hostname-verifying path: without a
         # verifyhostname it would be chain-only (any GlobalSign-R3-chained cert

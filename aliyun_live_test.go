@@ -55,7 +55,7 @@ func TestAliyunProviderLive(t *testing.T) {
 	// real doRequest — proving the h2 transport path fronts a cross-org Host
 	// (Bilibili) over a TLS session bearing Alibaba's certificate.
 	var dialed int
-	var frontedOK bool
+	var frontedOK, frontedOverH2 bool
 	for _, m := range p.Masquerades {
 		require.NotEmpty(t, m.SNI, "expanded masquerade should carry an SNI")
 
@@ -86,8 +86,14 @@ func TestAliyunProviderLive(t *testing.T) {
 			crossOrgHost, m.IpAddress, m.SNI, proto, resp.StatusCode, resp.ProtoMajor, strings.TrimSpace(string(body)))
 		if resp.StatusCode == http.StatusOK {
 			frontedOK = true
+			// Only count it as proving the h2 path when ALPN actually
+			// negotiated h2 and the response came back as HTTP/2.
+			if proto == "h2" && resp.ProtoMajor == 2 {
+				frontedOverH2 = true
+			}
 		}
 	}
 	require.NotZero(t, dialed, "no Aliyun edge IP completed TLS + GlobalSign verification")
-	require.True(t, frontedOK, "no edge served the cross-org Host (%s) — h2 fronting did not route", crossOrgHost)
+	require.True(t, frontedOK, "no edge served the cross-org Host (%s) — fronting did not route", crossOrgHost)
+	require.True(t, frontedOverH2, "no edge fronted %s over HTTP/2 — the h2 path was not exercised", crossOrgHost)
 }
