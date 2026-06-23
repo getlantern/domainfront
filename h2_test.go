@@ -4,6 +4,7 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"testing"
@@ -14,23 +15,15 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// TestDoRequest_HTTP2 verifies that when the TLS handshake negotiates h2,
-// doRequest frames the fronted request as HTTP/2 and the fronted host lands in
-// the :authority pseudo-header (the h2 equivalent of the Host header that drives
-// CDN routing). It uses a pipe-backed h2 server, so no real network is touched.
-func TestDoRequest_HTTP2(t *testing.T) {
+// dialPipeH2 stands up an HTTP/2 server on one end of a net.Pipe (TLS with
+// ALPN "h2") and returns a handshaken utls client connection to it — the same
+// connection type dialFront produces in production. No real network is used.
+func dialPipeH2(t *testing.T, handler http.Handler) *utls.UConn {
+	t.Helper()
 	ca, caKey := newTestCA(t)
 	leaf := newTestLeafCert(t, ca, caKey, "cdn.example.com")
 	roots := x509.NewCertPool()
 	roots.AddCert(ca)
-
-	type observed struct {
-		authority string
-		path      string
-		proto     int
-		hdr       string
-	}
-	seen := make(chan observed, 1)
 
 	clientRaw, serverRaw := net.Pipe()
 	go func() {
@@ -42,13 +35,7 @@ func TestDoRequest_HTTP2(t *testing.T) {
 			serverRaw.Close()
 			return
 		}
-		(&http2.Server{}).ServeConn(srv, &http2.ServeConnOpts{
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				seen <- observed{r.Host, r.URL.Path, r.ProtoMajor, r.Header.Get("X-Probe")}
-				w.WriteHeader(http.StatusOK)
-				io.WriteString(w, "h2-fronted-ok")
-			}),
-		})
+		(&http2.Server{}).ServeConn(srv, &http2.ServeConnOpts{Handler: handler})
 	}()
 
 	uconn := utls.UClient(clientRaw, &utls.Config{
@@ -58,12 +45,30 @@ func TestDoRequest_HTTP2(t *testing.T) {
 	}, utls.HelloGolang)
 	require.NoError(t, uconn.Handshake())
 	require.Equal(t, "h2", negotiatedProtocol(uconn), "handshake should negotiate h2")
+	return uconn
+}
+
+// TestDoRequest_HTTP2 verifies that when the TLS handshake negotiates h2,
+// doRequest frames the fronted request as HTTP/2 and the fronted host lands in
+// the :authority pseudo-header (the h2 equivalent of the Host header that drives
+// CDN routing).
+func TestDoRequest_HTTP2(t *testing.T) {
+	type observed struct {
+		authority, path, hdr string
+		proto                int
+	}
+	seen := make(chan observed, 1)
+	conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- observed{r.Host, r.URL.Path, r.Header.Get("X-Probe"), r.ProtoMajor}
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "h2-fronted-ok")
+	}))
 
 	req, err := http.NewRequest(http.MethodGet, "https://config.example.com/api/data", nil)
 	require.NoError(t, err)
 	req.Header.Set("X-Probe", "carried")
 
-	resp, err := (&roundTripper{}).doRequest(req, uconn, "cdn.example.com", nil)
+	resp, err := (&roundTripper{}).doRequest(req, conn, "cdn.example.com", nil)
 	require.NoError(t, err)
 
 	body, err := io.ReadAll(resp.Body)
@@ -79,4 +84,36 @@ func TestDoRequest_HTTP2(t *testing.T) {
 	assert.Equal(t, "/api/data", got.path, "path must be preserved from the original request")
 	assert.Equal(t, 2, got.proto, "server must see an HTTP/2 request")
 	assert.Equal(t, "carried", got.hdr, "caller headers must propagate")
+}
+
+// TestVerifyWithPost_HTTP2 covers the front-vetting path over an h2 connection.
+// Vetting gates whether a front becomes usable, so it must speak h2 just like
+// request traffic — otherwise every h2 edge (CloudFront, Aliyun) fails to vet.
+func TestVerifyWithPost_HTTP2(t *testing.T) {
+	gotMethod := make(chan string, 1)
+	conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod <- r.Method
+		w.WriteHeader(http.StatusAccepted) // 202: the contract verifyWithPost checks
+	}))
+
+	c := &Client{log: slog.Default()}
+	ok := c.verifyWithPost(conn, "https://cdn.example.com/ping")
+
+	assert.True(t, ok, "a 202 over h2 should vet successfully")
+	assert.Equal(t, http.MethodPost, <-gotMethod)
+}
+
+func TestHasConnectionUpgrade(t *testing.T) {
+	mk := func(vals ...string) *http.Request {
+		r, _ := http.NewRequest(http.MethodGet, "https://x/", nil)
+		for _, v := range vals {
+			r.Header.Add("Connection", v)
+		}
+		return r
+	}
+	assert.True(t, hasConnectionUpgrade(mk("upgrade")))
+	assert.True(t, hasConnectionUpgrade(mk("keep-alive, Upgrade")), "token in a comma list")
+	assert.True(t, hasConnectionUpgrade(mk("keep-alive", "Upgrade")), "multiple header values")
+	assert.False(t, hasConnectionUpgrade(mk("keep-alive")))
+	assert.False(t, hasConnectionUpgrade(mk()))
 }

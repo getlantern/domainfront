@@ -66,14 +66,14 @@ type Client struct {
 // Option configures a Client.
 type Option func(*Client)
 
-func WithLogger(l *slog.Logger) Option        { return func(c *Client) { c.log = l } }
-func WithDialer(d Dialer) Option              { return func(c *Client) { c.dialer = d } }
-func WithCountryCode(cc string) Option        { return func(c *Client) { c.countryCode = cc } }
-func WithDefaultProviderID(id string) Option  { return func(c *Client) { c.defaultPID = id } }
-func WithConfigURL(url string) Option         { return func(c *Client) { c.configURL = url } }
-func WithHTTPClient(hc *http.Client) Option   { return func(c *Client) { c.httpClient = hc } }
-func WithCache(cache Cache) Option            { return func(c *Client) { c.cache = cache } }
-func WithMaxRetries(n int) Option             { return func(c *Client) { c.maxRetries = n } }
+func WithLogger(l *slog.Logger) Option       { return func(c *Client) { c.log = l } }
+func WithDialer(d Dialer) Option             { return func(c *Client) { c.dialer = d } }
+func WithCountryCode(cc string) Option       { return func(c *Client) { c.countryCode = cc } }
+func WithDefaultProviderID(id string) Option { return func(c *Client) { c.defaultPID = id } }
+func WithConfigURL(url string) Option        { return func(c *Client) { c.configURL = url } }
+func WithHTTPClient(hc *http.Client) Option  { return func(c *Client) { c.httpClient = hc } }
+func WithCache(cache Cache) Option           { return func(c *Client) { c.cache = cache } }
+func WithMaxRetries(n int) Option            { return func(c *Client) { c.maxRetries = n } }
 func WithClientHelloID(id tls.ClientHelloID) Option {
 	return func(c *Client) { c.clientHelloID = id }
 }
@@ -328,15 +328,15 @@ func (c *Client) vetFront(f *front) bool {
 var vetBody = []byte("a")
 
 func (c *Client) verifyWithPost(conn net.Conn, testURL string) bool {
-	tr := newConnTransport(conn, true)
 	req, err := http.NewRequest(http.MethodPost, testURL, bytes.NewReader(vetBody))
 	if err != nil {
 		c.log.Debug("Error creating vet request", "error", err)
 		return false
 	}
-	req.URL.Scheme = "http" // TLS already established on conn
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := tr.RoundTrip(req)
+	// Frame the vet request to match the negotiated ALPN — the dialed front
+	// may have negotiated h2, exactly like real request traffic.
+	resp, err := sendOverConn(conn, req, true)
 	if err != nil {
 		c.log.Debug("Error vetting front", "error", err, "url", testURL)
 		return false

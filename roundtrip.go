@@ -88,23 +88,10 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost string, body io.ReadCloser) (*http.Response, error) {
 	fronted := rewriteRequest(req, frontedHost, body)
 
-	var resp *http.Response
-	var err error
-	if negotiatedProtocol(conn) == "h2" {
-		// The edge selected HTTP/2 via ALPN (CloudFront and Aliyun both do
-		// under a real-browser ClientHello). Frame the request as h2 over the
-		// already-established conn. rewriteRequest set the scheme to "http" for
-		// the h1 transport's benefit; restore "https" so the :authority/:scheme
-		// pseudo-headers match what a browser sends over TLS.
-		fronted.URL.Scheme = "https"
-		resp, err = roundTripH2(conn, fronted)
-	} else {
-		disableKeepAlives := true
-		if strings.EqualFold(req.Header.Get("Connection"), "upgrade") {
-			disableKeepAlives = false
-		}
-		resp, err = newConnTransport(conn, disableKeepAlives).RoundTrip(fronted)
-	}
+	// One connection per request, so HTTP/1.1 keep-alives are disabled — unless
+	// this is a protocol upgrade (e.g. WebSocket), which needs the connection
+	// left intact for hijacking.
+	resp, err := sendOverConn(conn, fronted, !hasConnectionUpgrade(req))
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +105,25 @@ func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost 
 	return resp, nil
 }
 
+// sendOverConn sends req over the already-established TLS conn, framing it to
+// match the protocol negotiated via ALPN: HTTP/2 when the edge selected "h2"
+// (CloudFront, Aliyun, ...), HTTP/1.1 otherwise. Every caller that speaks over
+// a dialed front — request round-trips and front vetting alike — must go
+// through here so the wire framing stays consistent with the negotiated ALPN;
+// unconditionally speaking HTTP/1.1 over an h2 connection yields a "malformed
+// HTTP response" on the first h2 frame.
+func sendOverConn(conn net.Conn, req *http.Request, disableKeepAlives bool) (*http.Response, error) {
+	if negotiatedProtocol(conn) == "h2" {
+		// Restore "https" so the :scheme/:authority pseudo-headers match what a
+		// browser sends over TLS; roundTripH2 frames over the existing conn.
+		req.URL.Scheme = "https"
+		return roundTripH2(conn, req)
+	}
+	// TLS is already established on conn, so "http" avoids a second handshake.
+	req.URL.Scheme = "http"
+	return newConnTransport(conn, disableKeepAlives).RoundTrip(req)
+}
+
 // negotiatedProtocol reports the ALPN protocol settled during the TLS
 // handshake ("h2", "http/1.1", or "" when none was negotiated). In production
 // conn is always the utls client connection from dialFront.
@@ -126,6 +132,20 @@ func negotiatedProtocol(conn net.Conn) string {
 		return c.ConnectionState().NegotiatedProtocol
 	}
 	return ""
+}
+
+// hasConnectionUpgrade reports whether the request's Connection header lists an
+// "upgrade" token. Connection is a comma-separated token list, so a plain
+// equality check would miss common values like "keep-alive, Upgrade".
+func hasConnectionUpgrade(req *http.Request) bool {
+	for _, v := range req.Header.Values("Connection") {
+		for tok := range strings.SplitSeq(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // roundTripH2 sends req over conn using HTTP/2 framing. The library dials a
@@ -155,9 +175,13 @@ type h2Body struct {
 }
 
 func (b *h2Body) Close() error {
-	err := b.ReadCloser.Close()
-	b.once.Do(func() { b.cc.Close() })
-	return err
+	bodyErr := b.ReadCloser.Close()
+	var ccErr error
+	b.once.Do(func() { ccErr = b.cc.Close() })
+	if bodyErr != nil {
+		return bodyErr
+	}
+	return ccErr
 }
 
 // newConnTransport creates an http.RoundTripper that sends requests over a
