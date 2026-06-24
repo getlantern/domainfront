@@ -175,7 +175,9 @@ func hasConnectionUpgrade(req *http.Request) bool {
 // (RFC 7540 §8.1.2.2). Any field named in the Connection header is itself
 // connection-specific and removed too. Without this, x/net/http2 rejects a
 // request carrying e.g. Transfer-Encoding or a non-close/keep-alive Connection
-// token. It mutates the already-copied fronted request, never the caller's.
+// token. It mutates req's headers in place; both callers pass a request they
+// own (doRequest the fronted copy from rewriteRequest, verifyWithPost a freshly
+// built vetting request), so no shared or caller-owned request is affected.
 func stripConnHeaders(req *http.Request) {
 	for _, v := range req.Header.Values("Connection") {
 		for tok := range strings.SplitSeq(v, ",") {

@@ -17,7 +17,7 @@ A clean, production-grade domain fronting library for Go.
 - **Country-aware SNI** — deterministic SNI selection from per-country lists, derived from IP hash
 - **Persistent caching** — working fronts are cached to disk (JSON) for fast startup
 - **Auto-updating config** — optionally fetches updated `fronted.yaml.gz` from a URL every 12 hours
-- **Minimal dependencies** — `utls`, `go-yaml`, and `x/net/http2`; no worker pool libraries, no logging frameworks, no custom HTTP fetchers
+- **Minimal dependencies** — `utls`, `go-yaml`, and `golang.org/x/net/http2`; no worker pool libraries, no logging frameworks, no custom HTTP fetchers
 - **Fully testable** — `Dialer` and `Cache` interfaces; unit tests use pipe-based mock TLS servers, no real CDN infrastructure required
 
 ## Installation

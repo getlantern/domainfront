@@ -57,6 +57,11 @@ func dialPipeH2(t *testing.T, handler http.Handler) *utls.UConn {
 	}, utls.HelloGolang)
 	require.NoError(t, uconn.HandshakeContext(ctx))
 	require.Equal(t, "h2", negotiatedProtocol(uconn), "handshake should negotiate h2")
+	// Close the conn at test end so the server goroutine's ServeConn unblocks
+	// (it otherwise reads the pipe until close). Tests that complete a request
+	// already tear the conn down via resp.Body.Close; this also covers tests
+	// that never send one (e.g. an upgrade rejected before any round-trip).
+	t.Cleanup(func() { _ = uconn.Close(); _ = serverRaw.Close() })
 	return uconn
 }
 
