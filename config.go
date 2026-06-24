@@ -27,11 +27,11 @@ type CA struct {
 
 // Provider is a domain fronting provider (e.g. Akamai, CloudFront).
 type Provider struct {
-	HostAliases         map[string]string    `yaml:"hostaliases"`
-	PassthroughPatterns []string             `yaml:"passthrupatterns"`
-	TestURL             string               `yaml:"testurl"`
-	Masquerades         []*Masquerade        `yaml:"masquerades"`
-	VerifyHostname      *string              `yaml:"verifyhostname"`
+	HostAliases         map[string]string `yaml:"hostaliases"`
+	PassthroughPatterns []string          `yaml:"passthrupatterns"`
+	TestURL             string            `yaml:"testurl"`
+	Masquerades         []*Masquerade     `yaml:"masquerades"`
+	VerifyHostname      *string           `yaml:"verifyhostname"`
 	// Pipeline-emitted YAML keys are lowercase-concatenated, not
 	// snake_case (the upstream generator uses lowercased Go field
 	// names with no yaml tag); the tag here must match the wire
@@ -133,9 +133,11 @@ func (cfg *Config) CertPool() (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// ExpandedProvider returns a copy of the provider with masquerades expanded
-// with SNI based on the country code. Host aliases are lowercased.
-// Passthrough patterns are also lowercased for efficient lookup.
+// ExpandedProvider returns a copy of the provider with each masquerade's SNI
+// resolved: a country-specific or "default" arbitrary SNI if the provider
+// configures one (the "default" strategy applies even with no country code),
+// otherwise the masquerade's baked-in SNI, otherwise empty (SNI omitted). Host
+// aliases and passthrough patterns are lowercased for efficient lookup.
 func ExpandedProvider(p *Provider, countryCode string) *Provider {
 	ep := &Provider{
 		HostAliases:         make(map[string]string, len(p.HostAliases)),
@@ -154,8 +156,13 @@ func ExpandedProvider(p *Provider, countryCode string) *Provider {
 		ep.PassthroughPatterns[i] = strings.ToLower(pt)
 	}
 
+	// Select the SNI strategy: a country-specific entry if one matches, else the
+	// "default" entry. The default applies even when no country code is set, so a
+	// provider's default arbitrary-SNI strategy is active for every client — the
+	// production client passes no country code, and gating "default" behind one
+	// would leave the strategy permanently inert.
 	var sniCfg *SNIConfig
-	if countryCode != "" && p.FrontingSNIs != nil {
+	if p.FrontingSNIs != nil {
 		var ok bool
 		sniCfg, ok = p.FrontingSNIs[countryCode]
 		if !ok {
@@ -164,13 +171,41 @@ func ExpandedProvider(p *Provider, countryCode string) *Provider {
 	}
 
 	for _, m := range p.Masquerades {
-		sni := GenerateSNI(sniCfg, m.IpAddress)
-		ep.Masquerades = append(ep.Masquerades, &Masquerade{
+		// A generated SNI (country-specific or "default" arbitrary-SNI strategy)
+		// takes precedence. Otherwise keep any SNI baked into the masquerade by
+		// the config — this lets a provider whose edges require a specific front
+		// SNI pin one per masquerade without depending on a country code being
+		// set (the production client sets none). Empty stays empty (SNI omitted).
+		sni := m.SNI
+		if g := GenerateSNI(sniCfg, m.IpAddress); g != "" {
+			sni = g
+		}
+		nm := &Masquerade{
 			Domain:         m.Domain,
 			IpAddress:      m.IpAddress,
 			SNI:            sni,
-			VerifyHostname: p.VerifyHostname,
-		})
+			VerifyHostname: m.VerifyHostname,
+		}
+		// Resolve the hostname the edge cert is verified against on the SNI path
+		// (dialFront): a per-masquerade value wins, then the provider default,
+		// and finally the front Domain. Defaulting to Domain matters because the
+		// SNI path otherwise falls back to chain-only verification when no
+		// hostname is set — accepting any cert that chains to a trusted root
+		// (for a single-CA pool like aliyun's GlobalSign R3, any R3-issued cert,
+		// which a network MITM could present). We verify against Domain, NOT the
+		// SNI: the SNI is often a decoy the served cert doesn't cover (akamai
+		// edges send SNI=crunchbase.com but serve their a248.e.akamai.net cert),
+		// whereas the cert IS valid for the front Domain — the same check the
+		// no-SNI path already does.
+		if nm.VerifyHostname == nil {
+			nm.VerifyHostname = p.VerifyHostname
+		}
+		if nm.VerifyHostname == nil && sni != "" && nm.Domain != "" {
+			// Point at the new masquerade's own Domain field rather than a
+			// loop-local copy, avoiding a per-iteration heap allocation.
+			nm.VerifyHostname = &nm.Domain
+		}
+		ep.Masquerades = append(ep.Masquerades, nm)
 	}
 	return ep
 }
