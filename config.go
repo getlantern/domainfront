@@ -180,6 +180,12 @@ func ExpandedProvider(p *Provider, countryCode string) *Provider {
 		if g := GenerateSNI(sniCfg, m.IpAddress); g != "" {
 			sni = g
 		}
+		nm := &Masquerade{
+			Domain:         m.Domain,
+			IpAddress:      m.IpAddress,
+			SNI:            sni,
+			VerifyHostname: m.VerifyHostname,
+		}
 		// Resolve the hostname the edge cert is verified against on the SNI path
 		// (dialFront): a per-masquerade value wins, then the provider default,
 		// and finally the front Domain. Defaulting to Domain matters because the
@@ -191,20 +197,15 @@ func ExpandedProvider(p *Provider, countryCode string) *Provider {
 		// edges send SNI=crunchbase.com but serve their a248.e.akamai.net cert),
 		// whereas the cert IS valid for the front Domain — the same check the
 		// no-SNI path already does.
-		verifyHostname := m.VerifyHostname
-		if verifyHostname == nil {
-			verifyHostname = p.VerifyHostname
+		if nm.VerifyHostname == nil {
+			nm.VerifyHostname = p.VerifyHostname
 		}
-		if verifyHostname == nil && sni != "" && m.Domain != "" {
-			d := m.Domain
-			verifyHostname = &d
+		if nm.VerifyHostname == nil && sni != "" && nm.Domain != "" {
+			// Point at the new masquerade's own Domain field rather than a
+			// loop-local copy, avoiding a per-iteration heap allocation.
+			nm.VerifyHostname = &nm.Domain
 		}
-		ep.Masquerades = append(ep.Masquerades, &Masquerade{
-			Domain:         m.Domain,
-			IpAddress:      m.IpAddress,
-			SNI:            sni,
-			VerifyHostname: verifyHostname,
-		})
+		ep.Masquerades = append(ep.Masquerades, nm)
 	}
 	return ep
 }
