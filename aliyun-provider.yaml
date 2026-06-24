@@ -58,6 +58,9 @@ providers:
         # bypassing Cloudflare) with back-to-origin SNI = that origin and
         # back-to-origin Host = the service domain. Validated 2026-06-23: fronting
         # each via img.alicdn.com returns byte-identical responses to the origin.
+        # NOTE: These hostaliases and testurl are real, validated mappings.
+        # aliyun_live_test.go reads this file directly; if you intend placeholders,
+        # update the PR description and replace these with clearly marked REPLACE-ME values.
         hostaliases:
             config.getiantem.org: config.dcdn.getiantem.org
             api.getiantem.org: api.dcdn.getiantem.org
