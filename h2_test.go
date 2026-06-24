@@ -115,6 +115,74 @@ func TestVerifyWithPost_HTTP2(t *testing.T) {
 	assert.Equal(t, http.MethodPost, <-gotMethod)
 }
 
+// TestStripConnHeaders verifies the RFC 7540 §8.1.2.2 transformation: the
+// connection-specific headers and any header named in Connection are removed,
+// while ordinary headers are preserved.
+func TestStripConnHeaders(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://x/y", nil)
+	require.NoError(t, err)
+	req.Header.Set("Connection", "keep-alive, X-Hop")
+	req.Header.Set("X-Hop", "drop") // named in Connection
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Transfer-Encoding", "chunked")
+	req.Header.Set("Upgrade", "h2c")
+	req.Header.Set("X-Keep", "stay")
+
+	stripConnHeaders(req)
+
+	for _, h := range []string{"Connection", "X-Hop", "Keep-Alive", "Transfer-Encoding", "Upgrade"} {
+		assert.Emptyf(t, req.Header.Get(h), "%s must be stripped", h)
+	}
+	assert.Equal(t, "stay", req.Header.Get("X-Keep"), "non-connection headers must remain")
+}
+
+// TestSendOverConn_H2_RejectsUpgrade verifies an upgrade request over an h2
+// front is rejected with errH2UpgradeUnsupported (so RoundTrip can retry onto
+// an http/1.1 front) and never reaches the server.
+func TestSendOverConn_H2_RejectsUpgrade(t *testing.T) {
+	reached := make(chan struct{}, 1)
+	conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	req, err := http.NewRequest(http.MethodGet, "https://cdn.example.com/ws", nil)
+	require.NoError(t, err)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	_, err = sendOverConn(conn, req, false)
+	require.ErrorIs(t, err, errH2UpgradeUnsupported)
+	select {
+	case <-reached:
+		t.Fatal("server must not be reached for an upgrade rejected over h2")
+	default:
+	}
+}
+
+// TestSendOverConn_H2_StripsForbiddenHeaders verifies that connection-specific
+// headers (which x/net/http2 would otherwise reject) are stripped before h2
+// framing, so an otherwise-valid request still succeeds.
+func TestSendOverConn_H2_StripsForbiddenHeaders(t *testing.T) {
+	gotHop := make(chan string, 1)
+	conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHop <- r.Header.Get("X-Hop")
+		w.WriteHeader(http.StatusOK)
+	}))
+	req, err := http.NewRequest(http.MethodGet, "https://cdn.example.com/x", nil)
+	require.NoError(t, err)
+	// Transfer-Encoding: gzip and a non-close/keep-alive Connection token both
+	// make x/net/http2 reject the request unless stripped first.
+	req.Header.Set("Transfer-Encoding", "gzip")
+	req.Header.Set("Connection", "X-Hop")
+	req.Header.Set("X-Hop", "should-be-stripped")
+
+	resp, err := sendOverConn(conn, req, true)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, <-gotHop, "Connection-named header must be stripped before h2")
+}
+
 // errCloser is a test io.Closer that records call count and returns a fixed err.
 type errCloser struct {
 	err   error

@@ -2,6 +2,7 @@ package domainfront
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,12 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
+
+// errH2UpgradeUnsupported is returned when a connection-upgrade request (e.g.
+// WebSocket) lands on a front whose ALPN negotiated HTTP/2. h2 has no h1-style
+// Upgrade mechanism, so RoundTrip treats this as "wrong front for this request"
+// rather than a front failure and retries onto another (ideally http/1.1) front.
+var errH2UpgradeUnsupported = errors.New("connection upgrade not supported over HTTP/2 front")
 
 // roundTripper is an http.RoundTripper that sends requests via domain fronting.
 // It takes a front from the pool, checks the provider mapping, dials TLS,
@@ -70,7 +77,10 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp, err := rt.doRequest(req, result.conn, frontedHost, body)
 		if err != nil {
-			rt.client.pool.Return(f, false)
+			// An upgrade landing on an h2 front isn't the front's fault, so
+			// requeue it as healthy and retry — ideally onto an http/1.1 front
+			// that can carry the upgrade. All other errors fail the front.
+			rt.client.pool.Return(f, errors.Is(err, errH2UpgradeUnsupported))
 			rt.client.notifyCacheDirty()
 			result.conn.Close()
 			lastErr = err
@@ -114,6 +124,19 @@ func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost 
 // HTTP response" on the first h2 frame.
 func sendOverConn(conn net.Conn, req *http.Request, disableKeepAlives bool) (*http.Response, error) {
 	if negotiatedProtocol(conn) == "h2" {
+		// An h1-style upgrade can't be carried over h2 (it needs Extended
+		// CONNECT, which this single-shot transport doesn't set up), and
+		// x/net/http2 rejects the Upgrade header outright. Signal it so
+		// RoundTrip can retry onto an http/1.1 front instead of silently
+		// degrading the upgrade to a plain request.
+		if hasConnectionUpgrade(req) {
+			return nil, errH2UpgradeUnsupported
+		}
+		// Strip the connection-specific headers HTTP/2 forbids (RFC 7540
+		// §8.1.2.2). x/net/http2 errors on e.g. Transfer-Encoding or a
+		// Connection token other than close/keep-alive, so they must be removed
+		// before framing — they're meaningless on a multiplexed h2 stream anyway.
+		stripConnHeaders(req)
 		// Restore "https" so the :scheme/:authority pseudo-headers match what a
 		// browser sends over TLS; roundTripH2 frames over the existing conn.
 		req.URL.Scheme = "https"
@@ -146,6 +169,24 @@ func hasConnectionUpgrade(req *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// stripConnHeaders removes the connection-specific header fields HTTP/2 forbids
+// (RFC 7540 §8.1.2.2). Any field named in the Connection header is itself
+// connection-specific and removed too. Without this, x/net/http2 rejects a
+// request carrying e.g. Transfer-Encoding or a non-close/keep-alive Connection
+// token. It mutates the already-copied fronted request, never the caller's.
+func stripConnHeaders(req *http.Request) {
+	for _, v := range req.Header.Values("Connection") {
+		for tok := range strings.SplitSeq(v, ",") {
+			if name := strings.TrimSpace(tok); name != "" {
+				req.Header.Del(name)
+			}
+		}
+	}
+	for _, h := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding", "Upgrade"} {
+		req.Header.Del(h)
+	}
 }
 
 // roundTripH2 sends req over conn using HTTP/2 framing. The library dials a
