@@ -75,13 +75,17 @@ func TestAliyunProviderLive(t *testing.T) {
 		require.NoError(t, err)
 		resp, rerr := (&roundTripper{}).doRequest(req, res.conn, crossOrgHost, nil)
 		if rerr != nil {
-			res.conn.Close()
+			if cerr := res.conn.Close(); cerr != nil {
+				t.Logf("close conn for %s failed: %v", m.IpAddress, cerr)
+			}
 			cancel()
 			t.Logf("fronted GET via %s failed: %v", m.IpAddress, rerr)
 			continue
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 256))
-		resp.Body.Close() // h2Body close tears down the conn
+		if cerr := resp.Body.Close(); cerr != nil { // h2Body close tears down the conn
+			t.Logf("close response body for %s failed: %v", m.IpAddress, cerr)
+		}
 		cancel()
 		t.Logf("fronted %s via %s (SNI %s, %s): HTTP %d, proto=HTTP/%d, body=%q (readErr=%v)",
 			crossOrgHost, m.IpAddress, m.SNI, proto, resp.StatusCode, resp.ProtoMajor, strings.TrimSpace(string(body)), readErr)
