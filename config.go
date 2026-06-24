@@ -180,11 +180,30 @@ func ExpandedProvider(p *Provider, countryCode string) *Provider {
 		if g := GenerateSNI(sniCfg, m.IpAddress); g != "" {
 			sni = g
 		}
+		// Resolve the hostname the edge cert is verified against on the SNI path
+		// (dialFront): a per-masquerade value wins, then the provider default,
+		// and finally the front Domain. Defaulting to Domain matters because the
+		// SNI path otherwise falls back to chain-only verification when no
+		// hostname is set — accepting any cert that chains to a trusted root
+		// (for a single-CA pool like aliyun's GlobalSign R3, any R3-issued cert,
+		// which a network MITM could present). We verify against Domain, NOT the
+		// SNI: the SNI is often a decoy the served cert doesn't cover (akamai
+		// edges send SNI=crunchbase.com but serve their a248.e.akamai.net cert),
+		// whereas the cert IS valid for the front Domain — the same check the
+		// no-SNI path already does.
+		verifyHostname := m.VerifyHostname
+		if verifyHostname == nil {
+			verifyHostname = p.VerifyHostname
+		}
+		if verifyHostname == nil && sni != "" && m.Domain != "" {
+			d := m.Domain
+			verifyHostname = &d
+		}
 		ep.Masquerades = append(ep.Masquerades, &Masquerade{
 			Domain:         m.Domain,
 			IpAddress:      m.IpAddress,
 			SNI:            sni,
-			VerifyHostname: p.VerifyHostname,
+			VerifyHostname: verifyHostname,
 		})
 	}
 	return ep

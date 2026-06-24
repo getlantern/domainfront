@@ -100,6 +100,38 @@ func TestExpandedProvider(t *testing.T) {
 		assert.Equal(t, "www.mobgslb.tbcache.com", ep.Masquerades[0].SNI)
 	})
 
+	t.Run("VerifyHostname defaults to the front Domain when none is configured", func(t *testing.T) {
+		// Avoids chain-only verification on the SNI path. It defaults to Domain
+		// (the front domain the edge cert is actually for), NOT the SNI, which is
+		// often a decoy the served cert doesn't cover.
+		vp := &Provider{
+			Masquerades: []*Masquerade{{Domain: "img.alicdn.com", IpAddress: "1.2.3.4", SNI: "www.mobgslb.tbcache.com"}},
+		}
+		ep := ExpandedProvider(vp, "")
+		require.Len(t, ep.Masquerades, 1)
+		require.NotNil(t, ep.Masquerades[0].VerifyHostname)
+		assert.Equal(t, "img.alicdn.com", *ep.Masquerades[0].VerifyHostname)
+	})
+
+	t.Run("no SNI leaves VerifyHostname unset (no-SNI path verifies Domain)", func(t *testing.T) {
+		np := &Provider{Masquerades: []*Masquerade{{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}}}
+		ep := ExpandedProvider(np, "")
+		require.Len(t, ep.Masquerades, 1)
+		assert.Empty(t, ep.Masquerades[0].SNI)
+		assert.Nil(t, ep.Masquerades[0].VerifyHostname)
+	})
+
+	t.Run("per-masquerade VerifyHostname wins over the SNI default", func(t *testing.T) {
+		pinned := "pinned.example"
+		pp := &Provider{
+			Masquerades: []*Masquerade{{Domain: "img.alicdn.com", IpAddress: "1.2.3.4", SNI: "www.mobgslb.tbcache.com", VerifyHostname: &pinned}},
+		}
+		ep := ExpandedProvider(pp, "")
+		require.Len(t, ep.Masquerades, 1)
+		require.NotNil(t, ep.Masquerades[0].VerifyHostname)
+		assert.Equal(t, "pinned.example", *ep.Masquerades[0].VerifyHostname)
+	})
+
 	t.Run("generated SNI overrides a baked-in SNI", func(t *testing.T) {
 		op := &Provider{
 			Masquerades: []*Masquerade{{Domain: "cdn.example.com", IpAddress: "1.2.3.4", SNI: "baked.example"}},
