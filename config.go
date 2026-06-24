@@ -27,11 +27,11 @@ type CA struct {
 
 // Provider is a domain fronting provider (e.g. Akamai, CloudFront).
 type Provider struct {
-	HostAliases         map[string]string    `yaml:"hostaliases"`
-	PassthroughPatterns []string             `yaml:"passthrupatterns"`
-	TestURL             string               `yaml:"testurl"`
-	Masquerades         []*Masquerade        `yaml:"masquerades"`
-	VerifyHostname      *string              `yaml:"verifyhostname"`
+	HostAliases         map[string]string `yaml:"hostaliases"`
+	PassthroughPatterns []string          `yaml:"passthrupatterns"`
+	TestURL             string            `yaml:"testurl"`
+	Masquerades         []*Masquerade     `yaml:"masquerades"`
+	VerifyHostname      *string           `yaml:"verifyhostname"`
 	// Pipeline-emitted YAML keys are lowercase-concatenated, not
 	// snake_case (the upstream generator uses lowercased Go field
 	// names with no yaml tag); the tag here must match the wire
@@ -133,9 +133,11 @@ func (cfg *Config) CertPool() (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// ExpandedProvider returns a copy of the provider with masquerades expanded
-// with SNI based on the country code. Host aliases are lowercased.
-// Passthrough patterns are also lowercased for efficient lookup.
+// ExpandedProvider returns a copy of the provider with each masquerade's SNI
+// resolved: a country-specific or "default" arbitrary SNI if the provider
+// configures one (the "default" strategy applies even with no country code),
+// otherwise the masquerade's baked-in SNI, otherwise empty (SNI omitted). Host
+// aliases and passthrough patterns are lowercased for efficient lookup.
 func ExpandedProvider(p *Provider, countryCode string) *Provider {
 	ep := &Provider{
 		HostAliases:         make(map[string]string, len(p.HostAliases)),
@@ -154,8 +156,13 @@ func ExpandedProvider(p *Provider, countryCode string) *Provider {
 		ep.PassthroughPatterns[i] = strings.ToLower(pt)
 	}
 
+	// Select the SNI strategy: a country-specific entry if one matches, else the
+	// "default" entry. The default applies even when no country code is set, so a
+	// provider's default arbitrary-SNI strategy is active for every client — the
+	// production client passes no country code, and gating "default" behind one
+	// would leave the strategy permanently inert.
 	var sniCfg *SNIConfig
-	if countryCode != "" && p.FrontingSNIs != nil {
+	if p.FrontingSNIs != nil {
 		var ok bool
 		sniCfg, ok = p.FrontingSNIs[countryCode]
 		if !ok {
@@ -164,7 +171,15 @@ func ExpandedProvider(p *Provider, countryCode string) *Provider {
 	}
 
 	for _, m := range p.Masquerades {
-		sni := GenerateSNI(sniCfg, m.IpAddress)
+		// A generated SNI (country-specific or "default" arbitrary-SNI strategy)
+		// takes precedence. Otherwise keep any SNI baked into the masquerade by
+		// the config — this lets a provider whose edges require a specific front
+		// SNI pin one per masquerade without depending on a country code being
+		// set (the production client sets none). Empty stays empty (SNI omitted).
+		sni := m.SNI
+		if g := GenerateSNI(sniCfg, m.IpAddress); g != "" {
+			sni = g
+		}
 		ep.Masquerades = append(ep.Masquerades, &Masquerade{
 			Domain:         m.Domain,
 			IpAddress:      m.IpAddress,

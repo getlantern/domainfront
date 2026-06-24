@@ -73,6 +73,44 @@ func TestExpandedProvider(t *testing.T) {
 		ep := ExpandedProvider(p, "")
 		assert.Equal(t, "api.cdn.com", ep.HostAliases["api.example.com"])
 	})
+
+	t.Run("default arbitrary SNI applies without a country code", func(t *testing.T) {
+		// The production client passes no country code; a provider's "default"
+		// arbitrary-SNI strategy must still apply (e.g. akamai sending SNI
+		// globally), not be gated behind a country code.
+		dp := &Provider{
+			Masquerades: []*Masquerade{{Domain: "cdn.example.com", IpAddress: "1.2.3.4"}},
+			FrontingSNIs: map[string]*SNIConfig{
+				"default": {UseArbitrarySNIs: true, ArbitrarySNIs: []string{"crunchbase.com"}},
+			},
+		}
+		ep := ExpandedProvider(dp, "")
+		require.Len(t, ep.Masquerades, 1)
+		assert.Equal(t, "crunchbase.com", ep.Masquerades[0].SNI)
+	})
+
+	t.Run("baked-in masquerade SNI is preserved when no SNI is generated", func(t *testing.T) {
+		// A provider whose edges require a specific front SNI can pin one per
+		// masquerade; with no arbitrary-SNI strategy it must survive expansion.
+		bp := &Provider{
+			Masquerades: []*Masquerade{{Domain: "img.alicdn.com", IpAddress: "1.2.3.4", SNI: "www.mobgslb.tbcache.com"}},
+		}
+		ep := ExpandedProvider(bp, "")
+		require.Len(t, ep.Masquerades, 1)
+		assert.Equal(t, "www.mobgslb.tbcache.com", ep.Masquerades[0].SNI)
+	})
+
+	t.Run("generated SNI overrides a baked-in SNI", func(t *testing.T) {
+		op := &Provider{
+			Masquerades: []*Masquerade{{Domain: "cdn.example.com", IpAddress: "1.2.3.4", SNI: "baked.example"}},
+			FrontingSNIs: map[string]*SNIConfig{
+				"default": {UseArbitrarySNIs: true, ArbitrarySNIs: []string{"generated.example"}},
+			},
+		}
+		ep := ExpandedProvider(op, "")
+		require.Len(t, ep.Masquerades, 1)
+		assert.Equal(t, "generated.example", ep.Masquerades[0].SNI)
+	})
 }
 
 func TestParseConfigYAML(t *testing.T) {
