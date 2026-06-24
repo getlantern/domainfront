@@ -1,0 +1,113 @@
+# Alibaba Cloud (Aliyun) CDN domain-fronting provider.
+#
+# Built & verified 2026-06-23 (US vantage point). Aliyun CDN edges route by the
+# HTTP Host header (h1) / :authority (h2) and ignore the TLS SNI for origin
+# selection, so a censor doing SNI filtering sees only the innocent front domain
+# (img.alicdn.com) while the request reaches the real target. Confirmed
+# cross-organization: a TLS session bearing Alibaba's *.tbcdn.cn cert (SNI
+# img.alicdn.com) reached Bilibili (s1.hdslb.com) and Momo (img.momocdn.com)
+# origins purely via the Host header.
+#
+# Two operational constraints discovered:
+#   1. TLS layer — the edge node must hold a cert valid for the SNI you present.
+#      img.alicdn.com is ideal: Alibaba's own *.tbcdn.cn cert (SAN *.alicdn.com,
+#      *.taobao.com, ...) is provisioned on ~every Aliyun node.
+#   2. The target Host must be an onboarded Aliyun CDN customer. A non-customer
+#      Host (e.g. www.example.com) makes the edge silently drop the connection.
+#      => Lantern's own DCDN distributions (config/api/geo/update.dcdn.getiantem.org)
+#         are onboarded and the hostaliases below are validated end-to-end.
+#
+# This file is a complete, standalone Config (parseable via ParseConfigYAML) so
+# it can be loaded directly for testing. The `aliyun:` block under `providers:`
+# is what gets merged into the upstream getlantern/fronted pipeline output.
+
+trustedcas:
+    # Anchor for the Alibaba leaf cert chain:
+    #   *.tbcdn.cn -> GlobalSign GCC R3 OV TLS CA 2024 -> GlobalSign Root CA - R3
+    - commonname: GlobalSign Root CA - R3
+      cert: |
+        -----BEGIN CERTIFICATE-----
+        MIIDXzCCAkegAwIBAgILBAAAAAABIVhTCKIwDQYJKoZIhvcNAQELBQAwTDEgMB4G
+        A1UECxMXR2xvYmFsU2lnbiBSb290IENBIC0gUjMxEzARBgNVBAoTCkdsb2JhbFNp
+        Z24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMDkwMzE4MTAwMDAwWhcNMjkwMzE4
+        MTAwMDAwWjBMMSAwHgYDVQQLExdHbG9iYWxTaWduIFJvb3QgQ0EgLSBSMzETMBEG
+        A1UEChMKR2xvYmFsU2lnbjETMBEGA1UEAxMKR2xvYmFsU2lnbjCCASIwDQYJKoZI
+        hvcNAQEBBQADggEPADCCAQoCggEBAMwldpB5BngiFvXAg7aEyiie/QV2EcWtiHL8
+        RgJDx7KKnQRfJMsuS+FggkbhUqsMgUdwbN1k0ev1LKMPgj0MK66X17YUhhB5uzsT
+        gHeMCOFJ0mpiLx9e+pZo34knlTifBtc+ycsmWQ1z3rDI6SYOgxXG71uL0gRgykmm
+        KPZpO/bLyCiR5Z2KYVc3rHQU3HTgOu5yLy6c+9C7v/U9AOEGM+iCK65TpjoWc4zd
+        QQ4gOsC0p6Hpsk+QLjJg6VfLuQSSaGjlOCZgdbKfd/+RFO+uIEn8rUAVSNECMWEZ
+        XriX7613t2Saer9fwRPvm2L7DWzgVGkWqQPabumDk3F2xmmFghcCAwEAAaNCMEAw
+        DgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFI/wS3+o
+        LkUkrk1Q+mOai97i3Ru8MA0GCSqGSIb3DQEBCwUAA4IBAQBLQNvAUKr+yAzv95ZU
+        RUm7lgAJQayzE4aGKAczymvmdLm6AC2upArT9fHxD4q/c2dKg8dEe3jgr25sbwMp
+        jjM5RcOO5LlXbKr8EpbsU8Yt5CRsuZRj+9xTaGdWPoO4zzUhw8lo/s7awlOqzJCK
+        6fBdRoyV3XpYKBovHd7NADdBj+1EbddTKJd+82cEHhXXipa0095MJ6RMG3NzdvQX
+        mcIfeg7jLQitChws/zyrVQ4PkX4268NXSb7hLi18YIvDQVETI53O9zJrlAGomecs
+        Mx86OyXShkDOOyyGeMlhLxS67ttVb9+E7gUJTb0o2HLO02JQZR7rkpeDMdmztcpH
+        WD9f
+        -----END CERTIFICATE-----
+
+providers:
+    aliyun:
+        # Origin -> Aliyun DCDN accelerated domain. The value is the *accelerated
+        # domain* (sent as the fronted Host), NOT the *.w.kunlungr.com edge CNAME:
+        # the edge vhosts on the accelerated domain (Host=CNAME returns 403).
+        # Each accelerated domain is an "overseas"-scope DCDN distribution whose
+        # origin is the raw iantem.io backend (api.iantem.io / update.iantem.io,
+        # bypassing Cloudflare) with back-to-origin SNI = that origin and
+        # back-to-origin Host = the service domain. Validated 2026-06-23: fronting
+        # each via img.alicdn.com returns byte-identical responses to the origin.
+        # NOTE: These hostaliases and testurl are real, validated mappings.
+        # aliyun_live_test.go reads this file directly; if you intend placeholders,
+        # update the PR description and replace these with clearly marked REPLACE-ME values.
+        hostaliases:
+            config.getiantem.org: config.dcdn.getiantem.org
+            api.getiantem.org: api.dcdn.getiantem.org
+            geo.getiantem.org: geo.dcdn.getiantem.org
+            update.getlantern.org: update.dcdn.getiantem.org
+        # testurl is POSTed through a vetted front (verifyWithPost expects 202).
+        # NOTE: the services above answer /ping with 404/301, not 202 — a
+        # dedicated 202 ping distribution (cf. Akamai's fronted-ping) should be
+        # added before relying on runtime vetting; this points at one for now.
+        testurl: https://config.dcdn.getiantem.org/ping
+        # Pin TLS verification to a real Alibaba cert. Because SNI is set (see
+        # frontingsnis), dialFront takes the hostname-verifying path: without a
+        # verifyhostname it would be chain-only (any GlobalSign-R3-chained cert
+        # would pass). Every masquerade edge serves Alibaba's *.tbcdn.cn cert,
+        # whose SANs include *.alicdn.com, so this single value validates the
+        # leaf for all of the rotating frontingsnis (img/gw/a.alicdn.com).
+        # NOTE: ExpandedProvider applies this provider-level value to every
+        # masquerade; per-masquerade verifyhostname is NOT propagated.
+        verifyhostname: img.alicdn.com
+        # frontingsnis drives the wire SNI. ExpandedProvider regenerates each
+        # masquerade's SNI from this list (deterministic by IP hash). A non-empty
+        # country code MUST be passed (WithCountryCode) for SNI to be emitted;
+        # otherwise the no-SNI fallback verifies the cert against the masquerade
+        # Domain (img.alicdn.com), which also works here.
+        frontingsnis:
+            default:
+                usearbitrarysnis: true
+                arbitrarysnis:
+                    - img.alicdn.com
+                    - gw.alicdn.com
+                    - a.alicdn.com
+        # Masquerades: Aliyun edge IPs verified 2026-06-23 to present the Alibaba
+        # *.tbcdn.cn cert. Each entry is just domain + ipaddress — SNI comes from
+        # frontingsnis and the verify hostname from the provider-level
+        # verifyhostname above (per-masquerade sni/verifyhostname are ignored by
+        # ExpandedProvider). The upstream pipeline should harvest a much larger
+        # pool from in-region vantage points; this is a seed set across 3 /24s.
+        masquerades:
+            - domain: img.alicdn.com
+              ipaddress: 155.102.54.137
+            - domain: img.alicdn.com
+              ipaddress: 155.102.54.138
+            - domain: img.alicdn.com
+              ipaddress: 163.181.66.200
+            - domain: img.alicdn.com
+              ipaddress: 163.181.66.201
+            - domain: img.alicdn.com
+              ipaddress: 8.25.82.183
+            - domain: img.alicdn.com
+              ipaddress: 8.25.82.184
