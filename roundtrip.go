@@ -12,6 +12,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
 )
 
@@ -75,7 +76,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, fmt.Errorf("failed to get request body: %w", bodyErr)
 		}
 
-		resp, err := rt.doRequest(req, result.conn, frontedHost, body)
+		resp, err := rt.doRequest(req, result.conn, frontedHost, f.ProviderID, body)
 		if err != nil {
 			// An upgrade landing on an h2 front isn't the front's fault, so
 			// requeue it as healthy and retry — ideally onto an http/1.1 front
@@ -95,8 +96,20 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return nil, fmt.Errorf("domain fronting failed after %d attempts: %w", rt.client.maxRetries, lastErr)
 }
 
-func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost string, body io.ReadCloser) (*http.Response, error) {
+func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost, providerID string, body io.ReadCloser) (*http.Response, error) {
 	fronted := rewriteRequest(req, frontedHost, body)
+
+	// Label which fronting provider carried this request so the origin can
+	// attribute fronted traffic per-provider (read server-side from the
+	// X-Lantern-Fronted-Via header). Only set it when absent so an
+	// edge-injected value (e.g. Akamai's) still takes precedence. Validate the
+	// value first: ProviderID comes from config, so a malformed one (control
+	// chars/CRLF) must not make the request unwritable or inject a header —
+	// skip labeling in that case rather than fail the request.
+	if providerID != "" && httpguts.ValidHeaderFieldValue(providerID) &&
+		fronted.Header.Get("X-Lantern-Fronted-Via") == "" {
+		fronted.Header.Set("X-Lantern-Fronted-Via", providerID)
+	}
 
 	// One connection per request, so HTTP/1.1 keep-alives are disabled — unless
 	// this is a protocol upgrade (e.g. WebSocket), which needs the connection

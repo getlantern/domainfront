@@ -71,12 +71,12 @@ func dialPipeH2(t *testing.T, handler http.Handler) *utls.UConn {
 // CDN routing).
 func TestDoRequest_HTTP2(t *testing.T) {
 	type observed struct {
-		authority, path, hdr string
-		proto                int
+		authority, path, hdr, frontedVia string
+		proto                            int
 	}
 	seen := make(chan observed, 1)
 	conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- observed{r.Host, r.URL.Path, r.Header.Get("X-Probe"), r.ProtoMajor}
+		seen <- observed{r.Host, r.URL.Path, r.Header.Get("X-Probe"), r.Header.Get("X-Lantern-Fronted-Via"), r.ProtoMajor}
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "h2-fronted-ok")
 	}))
@@ -85,7 +85,7 @@ func TestDoRequest_HTTP2(t *testing.T) {
 	require.NoError(t, err)
 	req.Header.Set("X-Probe", "carried")
 
-	resp, err := (&roundTripper{}).doRequest(req, conn, "cdn.example.com", nil)
+	resp, err := (&roundTripper{}).doRequest(req, conn, "cdn.example.com", "cloudfront", nil)
 	require.NoError(t, err)
 
 	body, err := io.ReadAll(resp.Body)
@@ -101,6 +101,28 @@ func TestDoRequest_HTTP2(t *testing.T) {
 	assert.Equal(t, "/api/data", got.path, "path must be preserved from the original request")
 	assert.Equal(t, 2, got.proto, "server must see an HTTP/2 request")
 	assert.Equal(t, "carried", got.hdr, "caller headers must propagate")
+	assert.Equal(t, "cloudfront", got.frontedVia, "provider must be labeled to the origin via X-Lantern-Fronted-Via")
+}
+
+// TestDoRequest_SkipsInvalidProviderID verifies that a ProviderID containing
+// control characters (which would otherwise make the request unwritable or risk
+// header injection) is not written as X-Lantern-Fronted-Via — labeling is
+// skipped rather than failing the request.
+func TestDoRequest_SkipsInvalidProviderID(t *testing.T) {
+	gotVia := make(chan string, 1)
+	conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotVia <- r.Header.Get("X-Lantern-Fronted-Via")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req, err := http.NewRequest(http.MethodGet, "https://config.example.com/x", nil)
+	require.NoError(t, err)
+
+	resp, err := (&roundTripper{}).doRequest(req, conn, "cdn.example.com", "akamai\r\nX-Evil: 1", nil)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Empty(t, <-gotVia, "an invalid ProviderID must not be written as a header")
 }
 
 // TestVerifyWithPost_HTTP2 covers the front-vetting path over an h2 connection.
