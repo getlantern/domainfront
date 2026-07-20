@@ -135,6 +135,60 @@ func (p *frontPool) Take(ctx context.Context) (*front, error) {
 	}
 }
 
+// maxProviderScan bounds how many ready fronts TakePreferringUntried will pull
+// while hunting for an untried provider, so a ready queue dominated by one
+// provider can't turn a single take into a large drain-and-requeue.
+const maxProviderScan = 8
+
+// TakePreferringUntried returns a working front, preferring one whose ProviderID
+// is not present in tried. It blocks (like Take) until at least one front is
+// available, then scans a bounded number of additional ready fronts without
+// blocking; every front it pulls but doesn't select is returned to the ready
+// queue. If no untried provider is immediately available it falls back to the
+// first front taken, so it never blocks longer than Take. A nil/empty tried map
+// makes it behave exactly like Take.
+func (p *frontPool) TakePreferringUntried(ctx context.Context, tried map[string]struct{}) (*front, error) {
+	first, err := p.Take(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, seen := tried[first.ProviderID]; !seen {
+		return first, nil
+	}
+
+	skipped := []*front{first}
+	selected := first
+	scan := min(p.readyCount(), maxProviderScan)
+	for i := 0; i < scan; i++ {
+		f, ok := p.tryTakeReady()
+		if !ok {
+			break // nothing more ready right now
+		}
+		if _, seen := tried[f.ProviderID]; !seen {
+			selected = f
+			break
+		}
+		skipped = append(skipped, f)
+	}
+	for _, s := range skipped {
+		if s != selected {
+			p.addReady(s)
+		}
+	}
+	return selected, nil
+}
+
+// tryTakeReady returns a ready front without blocking, or ok=false when none is
+// immediately available.
+func (p *frontPool) tryTakeReady() (*front, bool) {
+	select {
+	case f := <-p.ready:
+		return f, true
+	default:
+		return nil, false
+	}
+}
+
 // Return puts a front back into the ready queue without updating its success
 // timestamp. Use this when the front should be kept in rotation but no real
 // round trip occurred (e.g. provider mapping miss). Pass requeue=false to

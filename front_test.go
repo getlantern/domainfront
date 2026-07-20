@@ -95,6 +95,60 @@ func TestFrontPool_Close(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestFrontPool_TakePreferringUntried(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	t.Run("prefers a front from an untried provider", func(t *testing.T) {
+		pool := newFrontPool(0)
+		aliyun := newFront(&Masquerade{Domain: "a.com", IpAddress: "1.1.1.1"}, "aliyun")
+		cloudfront := newFront(&Masquerade{Domain: "c.com", IpAddress: "2.2.2.2"}, "cloudfront")
+		// aliyun ahead of cloudfront in the ready queue: a plain Take would pick
+		// aliyun again even though we've already tried it.
+		pool.addReady(aliyun)
+		pool.addReady(cloudfront)
+
+		got, err := pool.TakePreferringUntried(ctx, map[string]struct{}{"aliyun": {}})
+		require.NoError(t, err)
+		assert.Equal(t, "cloudfront", got.ProviderID, "should skip the already-tried provider")
+		// The skipped aliyun front must be returned to the queue, not dropped.
+		assert.Equal(t, 1, pool.readyCount())
+	})
+
+	t.Run("falls back to first when every ready provider was tried", func(t *testing.T) {
+		pool := newFrontPool(0)
+		f1 := newFront(&Masquerade{Domain: "a.com", IpAddress: "1.1.1.1"}, "aliyun")
+		f2 := newFront(&Masquerade{Domain: "b.com", IpAddress: "3.3.3.3"}, "aliyun")
+		pool.addReady(f1)
+		pool.addReady(f2)
+
+		got, err := pool.TakePreferringUntried(ctx, map[string]struct{}{"aliyun": {}})
+		require.NoError(t, err)
+		assert.Equal(t, "aliyun", got.ProviderID)
+		// The other tried front is requeued; only the selected one is consumed.
+		assert.Equal(t, 1, pool.readyCount())
+	})
+
+	t.Run("empty tried map behaves like Take", func(t *testing.T) {
+		pool := newFrontPool(0)
+		f := newFront(&Masquerade{Domain: "a.com", IpAddress: "1.1.1.1"}, "aliyun")
+		pool.addReady(f)
+
+		got, err := pool.TakePreferringUntried(ctx, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "1.1.1.1", got.IpAddress)
+		assert.Equal(t, 0, pool.readyCount())
+	})
+
+	t.Run("blocks until a front is available, then honors ctx cancel", func(t *testing.T) {
+		pool := newFrontPool(0)
+		deadline, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_, err := pool.TakePreferringUntried(deadline, map[string]struct{}{"aliyun": {}})
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+	})
+}
+
 func TestFrontPool_Candidates(t *testing.T) {
 	pool := newFrontPool(0)
 

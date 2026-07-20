@@ -49,6 +49,12 @@ type Client struct {
 	defaultPID    string
 	maxRetries    int
 
+	// retryableResponse decides whether a fronted response that completed but
+	// carried a rejection/failure status should be treated as a front failure
+	// and retried on another front rather than returned to the caller. See
+	// defaultRetryableResponse for the default.
+	retryableResponse func(*http.Response) bool
+
 	cache             Cache
 	maxCacheSize      int
 	maxCachedAge      time.Duration
@@ -74,6 +80,15 @@ func WithConfigURL(url string) Option        { return func(c *Client) { c.config
 func WithHTTPClient(hc *http.Client) Option  { return func(c *Client) { c.httpClient = hc } }
 func WithCache(cache Cache) Option           { return func(c *Client) { c.cache = cache } }
 func WithMaxRetries(n int) Option            { return func(c *Client) { c.maxRetries = n } }
+
+// WithRetryableResponse overrides the predicate that decides whether a fronted
+// response should be treated as a front failure and retried on another front
+// instead of being returned to the caller. The default (defaultRetryableResponse)
+// treats 403 and any 5xx as retryable. A predicate returning false leaves the
+// response to be returned unchanged.
+func WithRetryableResponse(fn func(*http.Response) bool) Option {
+	return func(c *Client) { c.retryableResponse = fn }
+}
 func WithClientHelloID(id tls.ClientHelloID) Option {
 	return func(c *Client) { c.clientHelloID = id }
 }
@@ -113,6 +128,7 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 		clientHelloID:      tls.HelloChrome_131,
 		defaultPID:         defaultProviderID,
 		maxRetries:         defaultMaxRetries,
+		retryableResponse:  defaultRetryableResponse,
 		cache:              NopCache{},
 		maxCacheSize:       defaultMaxCacheSize,
 		maxCachedAge:       defaultMaxAllowedCachedAge,
