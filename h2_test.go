@@ -71,12 +71,12 @@ func dialPipeH2(t *testing.T, handler http.Handler) *utls.UConn {
 // CDN routing).
 func TestDoRequest_HTTP2(t *testing.T) {
 	type observed struct {
-		authority, path, hdr string
-		proto                int
+		authority, path, hdr, frontedVia string
+		proto                            int
 	}
 	seen := make(chan observed, 1)
 	conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- observed{r.Host, r.URL.Path, r.Header.Get("X-Probe"), r.ProtoMajor}
+		seen <- observed{r.Host, r.URL.Path, r.Header.Get("X-Probe"), r.Header.Get("X-Lantern-Fronted-Via"), r.ProtoMajor}
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "h2-fronted-ok")
 	}))
@@ -85,7 +85,7 @@ func TestDoRequest_HTTP2(t *testing.T) {
 	require.NoError(t, err)
 	req.Header.Set("X-Probe", "carried")
 
-	resp, err := (&roundTripper{}).doRequest(req, conn, "cdn.example.com", nil)
+	resp, err := (&roundTripper{}).doRequest(req, conn, "cdn.example.com", "cloudfront", nil)
 	require.NoError(t, err)
 
 	body, err := io.ReadAll(resp.Body)
@@ -101,6 +101,7 @@ func TestDoRequest_HTTP2(t *testing.T) {
 	assert.Equal(t, "/api/data", got.path, "path must be preserved from the original request")
 	assert.Equal(t, 2, got.proto, "server must see an HTTP/2 request")
 	assert.Equal(t, "carried", got.hdr, "caller headers must propagate")
+	assert.Equal(t, "cloudfront", got.frontedVia, "provider must be labeled to the origin via X-Lantern-Fronted-Via")
 }
 
 // TestVerifyWithPost_HTTP2 covers the front-vetting path over an h2 connection.

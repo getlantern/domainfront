@@ -73,7 +73,7 @@ func TestAliyunProviderLive(t *testing.T) {
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+crossOrgHost+"/", nil)
 		require.NoError(t, err)
-		resp, rerr := (&roundTripper{}).doRequest(req, res.conn, crossOrgHost, nil)
+		resp, rerr := (&roundTripper{}).doRequest(req, res.conn, crossOrgHost, "aliyun", nil)
 		if rerr != nil {
 			if cerr := res.conn.Close(); cerr != nil {
 				t.Logf("close conn for %s failed: %v", m.IpAddress, cerr)

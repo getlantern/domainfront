@@ -115,7 +115,7 @@ func (rt *connectedRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 	}
 
 	inner := &roundTripper{client: rt.client}
-	resp, err := inner.doRequest(req, rt.conn, frontedHost, body)
+	resp, err := inner.doRequest(req, rt.conn, frontedHost, rt.front.ProviderID, body)
 	if err != nil {
 		rt.client.pool.Return(rt.front, false)
 		rt.client.notifyCacheDirty()
