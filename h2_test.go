@@ -127,7 +127,7 @@ func TestDoRequest_SkipsInvalidProviderID(t *testing.T) {
 
 // TestDoRequest_RetriesOnBadStatus verifies that a completed response carrying a
 // status the client treats as retryable (403 / 5xx by default) is not returned
-// to the caller: doRequest drains the body and returns a *retryableStatusError
+// to the caller: doRequest closes the body and returns a *retryableStatusError
 // so RoundTrip fails the front and retries. A 2xx passes through unchanged.
 func TestDoRequest_RetriesOnBadStatus(t *testing.T) {
 	tests := []struct {
