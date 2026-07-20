@@ -97,12 +97,6 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 			continue
 		}
 
-		// We're committed to sending a real request over this front, so record
-		// its provider: if this attempt fails (retryable status, EOF, timeout),
-		// the next retry prefers a different provider. Marking here rather than
-		// at Take avoids penalizing a provider we skipped for a missing mapping.
-		tried[f.ProviderID] = struct{}{}
-
 		body, bodyErr := bodyFactory()
 		if bodyErr != nil {
 			result.conn.Close()
@@ -114,8 +108,16 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			// An upgrade landing on an h2 front isn't the front's fault, so
 			// requeue it as healthy and retry — ideally onto an http/1.1 front
-			// that can carry the upgrade. All other errors fail the front.
-			rt.client.pool.Return(f, errors.Is(err, errH2UpgradeUnsupported))
+			// that can carry the upgrade. Leave the provider untried in that case
+			// so retries may reuse it for such a front. All other errors fail the
+			// front and mark its provider tried so the next retry prefers a
+			// different provider (a provider that connects but won't forward is
+			// escaped by switching providers, not just fronts).
+			isUpgrade := errors.Is(err, errH2UpgradeUnsupported)
+			if !isUpgrade {
+				tried[f.ProviderID] = struct{}{}
+			}
+			rt.client.pool.Return(f, isUpgrade)
 			rt.client.notifyCacheDirty()
 			result.conn.Close()
 			lastErr = err
@@ -155,16 +157,19 @@ func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost,
 
 	// A front that connects and answers but returns a rejection/failure status
 	// (default: 403 or 5xx) is very likely refusing to forward the fronted
-	// request rather than the origin failing. Drain and close the body, then
-	// return a retryable error so RoundTrip fails this front and retries on
-	// another — ideally from a different provider. Resolve the predicate
-	// nil-safely: tests construct a roundTripper with no client.
+	// request rather than the origin failing. Return a retryable error so
+	// RoundTrip fails this front and retries on another — ideally from a
+	// different provider. Resolve the predicate nil-safely: tests construct a
+	// roundTripper with no client.
 	retryable := defaultRetryableResponse
 	if rt.client != nil && rt.client.retryableResponse != nil {
 		retryable = rt.client.retryableResponse
 	}
 	if retryable(resp) {
-		io.Copy(io.Discard, resp.Body)
+		// Just close — don't drain. This transport is one connection per request
+		// (h1 keep-alives disabled; h2 conn torn down on body close), so draining
+		// buys no connection reuse and a huge or never-ending error body could
+		// stall the retry.
 		resp.Body.Close()
 		return nil, &retryableStatusError{status: resp.StatusCode}
 	}
