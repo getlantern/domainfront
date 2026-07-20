@@ -12,6 +12,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
 )
 
@@ -101,8 +102,12 @@ func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost,
 	// Label which fronting provider carried this request so the origin can
 	// attribute fronted traffic per-provider (read server-side from the
 	// X-Lantern-Fronted-Via header). Only set it when absent so an
-	// edge-injected value (e.g. Akamai's) still takes precedence.
-	if providerID != "" && fronted.Header.Get("X-Lantern-Fronted-Via") == "" {
+	// edge-injected value (e.g. Akamai's) still takes precedence. Validate the
+	// value first: ProviderID comes from config, so a malformed one (control
+	// chars/CRLF) must not make the request unwritable or inject a header —
+	// skip labeling in that case rather than fail the request.
+	if providerID != "" && httpguts.ValidHeaderFieldValue(providerID) &&
+		fronted.Header.Get("X-Lantern-Fronted-Via") == "" {
 		fronted.Header.Set("X-Lantern-Fronted-Via", providerID)
 	}
 

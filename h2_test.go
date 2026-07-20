@@ -104,6 +104,27 @@ func TestDoRequest_HTTP2(t *testing.T) {
 	assert.Equal(t, "cloudfront", got.frontedVia, "provider must be labeled to the origin via X-Lantern-Fronted-Via")
 }
 
+// TestDoRequest_SkipsInvalidProviderID verifies that a ProviderID containing
+// control characters (which would otherwise make the request unwritable or risk
+// header injection) is not written as X-Lantern-Fronted-Via — labeling is
+// skipped rather than failing the request.
+func TestDoRequest_SkipsInvalidProviderID(t *testing.T) {
+	gotVia := make(chan string, 1)
+	conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotVia <- r.Header.Get("X-Lantern-Fronted-Via")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req, err := http.NewRequest(http.MethodGet, "https://config.example.com/x", nil)
+	require.NoError(t, err)
+
+	resp, err := (&roundTripper{}).doRequest(req, conn, "cdn.example.com", "akamai\r\nX-Evil: 1", nil)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Empty(t, <-gotVia, "an invalid ProviderID must not be written as a header")
+}
+
 // TestVerifyWithPost_HTTP2 covers the front-vetting path over an h2 connection.
 // Vetting gates whether a front becomes usable, so it must speak h2 just like
 // request traffic — otherwise every h2 edge (CloudFront, Aliyun) fails to vet.
