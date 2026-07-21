@@ -22,6 +22,26 @@ import (
 // rather than a front failure and retries onto another (ideally http/1.1) front.
 var errH2UpgradeUnsupported = errors.New("connection upgrade not supported over HTTP/2 front")
 
+// retryableStatusError signals that a fronted request completed but returned a
+// status the client treats as a front failure (see Client.retryableResponse).
+// RoundTrip fails the front and retries the request on another one.
+type retryableStatusError struct{ status int }
+
+func (e *retryableStatusError) Error() string {
+	return fmt.Sprintf("front returned retryable status %d", e.status)
+}
+
+// defaultRetryableResponse reports whether a fronted response should be treated
+// as a front failure and retried on another front rather than returned to the
+// caller. A front (a CDN edge / fronting provider) that connects and completes a
+// request but answers 403 or 5xx is very likely rejecting or failing to forward
+// the fronted request — when other fronts succeed for the same origin the origin
+// isn't the problem — so we fail this front and retry, ideally onto a different
+// provider. Callers can override this via WithRetryableResponse.
+func defaultRetryableResponse(resp *http.Response) bool {
+	return resp.StatusCode == http.StatusForbidden || resp.StatusCode >= 500
+}
+
 // roundTripper is an http.RoundTripper that sends requests via domain fronting.
 // It takes a front from the pool, checks the provider mapping, dials TLS,
 // rewrites the request, and retries on failure.
@@ -39,9 +59,14 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("failed to buffer request body: %w", err)
 	}
 
+	// Track which providers we've already attempted this round so retries prefer
+	// a different fronting provider — a provider that connects but won't forward
+	// (e.g. an edge that answers 403/5xx) is escaped by trying another provider,
+	// not just another of its own fronts.
+	tried := make(map[string]struct{})
 	var lastErr error
 	for range rt.client.maxRetries {
-		f, err := rt.client.pool.Take(ctx)
+		f, err := rt.client.pool.TakePreferringUntried(ctx, tried)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get front: %w", err)
 		}
@@ -62,7 +87,10 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		result := dialFront(ctx, f, rt.client.certPool(), rt.client.clientHelloID, rt.client.dialer)
 		if result.err != nil {
-			// Dial failures should never be treated as successful fronts.
+			// Dial failures should never be treated as successful fronts. The
+			// front is removed from rotation (markFailed), so retries naturally
+			// move on without needing the provider-diversity hint below — mark
+			// tried only once we actually send a request over this provider.
 			rt.client.pool.Return(f, false)
 			rt.client.notifyCacheDirty()
 			lastErr = result.err
@@ -80,8 +108,16 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			// An upgrade landing on an h2 front isn't the front's fault, so
 			// requeue it as healthy and retry — ideally onto an http/1.1 front
-			// that can carry the upgrade. All other errors fail the front.
-			rt.client.pool.Return(f, errors.Is(err, errH2UpgradeUnsupported))
+			// that can carry the upgrade. Leave the provider untried in that case
+			// so retries may reuse it for such a front. All other errors fail the
+			// front and mark its provider tried so the next retry prefers a
+			// different provider (a provider that connects but won't forward is
+			// escaped by switching providers, not just fronts).
+			isUpgrade := errors.Is(err, errH2UpgradeUnsupported)
+			if !isUpgrade {
+				tried[f.ProviderID] = struct{}{}
+			}
+			rt.client.pool.Return(f, isUpgrade)
 			rt.client.notifyCacheDirty()
 			result.conn.Close()
 			lastErr = err
@@ -119,10 +155,23 @@ func (rt *roundTripper) doRequest(req *http.Request, conn net.Conn, frontedHost,
 		return nil, err
 	}
 
-	if resp.StatusCode == 403 {
-		io.Copy(io.Discard, resp.Body)
+	// A front that connects and answers but returns a rejection/failure status
+	// (default: 403 or 5xx) is very likely refusing to forward the fronted
+	// request rather than the origin failing. Return a retryable error so
+	// RoundTrip fails this front and retries on another — ideally from a
+	// different provider. Resolve the predicate nil-safely: tests construct a
+	// roundTripper with no client.
+	retryable := defaultRetryableResponse
+	if rt.client != nil && rt.client.retryableResponse != nil {
+		retryable = rt.client.retryableResponse
+	}
+	if retryable(resp) {
+		// Just close — don't drain. This transport is one connection per request
+		// (h1 keep-alives disabled; h2 conn torn down on body close), so draining
+		// buys no connection reuse and a huge or never-ending error body could
+		// stall the retry.
 		resp.Body.Close()
-		return nil, fmt.Errorf("CDN rejected request (403)")
+		return nil, &retryableStatusError{status: resp.StatusCode}
 	}
 
 	return resp, nil

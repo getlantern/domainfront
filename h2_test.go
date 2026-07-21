@@ -125,6 +125,61 @@ func TestDoRequest_SkipsInvalidProviderID(t *testing.T) {
 	assert.Empty(t, <-gotVia, "an invalid ProviderID must not be written as a header")
 }
 
+// TestDoRequest_RetriesOnBadStatus verifies that a completed response carrying a
+// status the client treats as retryable (403 / 5xx by default) is not returned
+// to the caller: doRequest closes the body and returns a *retryableStatusError
+// so RoundTrip fails the front and retries. A 2xx passes through unchanged.
+func TestDoRequest_RetriesOnBadStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		wantRetry bool
+	}{
+		{name: "403 is retryable", status: http.StatusForbidden, wantRetry: true},
+		{name: "500 is retryable", status: http.StatusInternalServerError, wantRetry: true},
+		{name: "502 is retryable", status: http.StatusBadGateway, wantRetry: true},
+		{name: "200 passes through", status: http.StatusOK, wantRetry: false},
+		{name: "404 passes through", status: http.StatusNotFound, wantRetry: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := dialPipeH2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				io.WriteString(w, "body")
+			}))
+			req, err := http.NewRequest(http.MethodGet, "https://config.example.com/x", nil)
+			require.NoError(t, err)
+
+			// Nil client: doRequest must fall back to defaultRetryableResponse.
+			resp, err := (&roundTripper{}).doRequest(req, conn, "cdn.example.com", "cloudfront", nil)
+			if tt.wantRetry {
+				require.Error(t, err)
+				var rse *retryableStatusError
+				require.ErrorAs(t, err, &rse, "expected a retryableStatusError")
+				assert.Equal(t, tt.status, rse.status)
+				assert.Nil(t, resp, "no response should be returned on a retryable status")
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, resp.Body.Close())
+				assert.Equal(t, tt.status, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestDefaultRetryableResponse pins the default retry predicate: 403 and any 5xx
+// are retryable; other statuses (2xx/3xx/4xx except 403) are not.
+func TestDefaultRetryableResponse(t *testing.T) {
+	retryable := []int{403, 500, 502, 503, 504, 599}
+	for _, s := range retryable {
+		assert.Truef(t, defaultRetryableResponse(&http.Response{StatusCode: s}), "status %d should be retryable", s)
+	}
+	notRetryable := []int{200, 204, 301, 400, 401, 404, 429}
+	for _, s := range notRetryable {
+		assert.Falsef(t, defaultRetryableResponse(&http.Response{StatusCode: s}), "status %d should not be retryable", s)
+	}
+}
+
 // TestVerifyWithPost_HTTP2 covers the front-vetting path over an h2 connection.
 // Vetting gates whether a front becomes usable, so it must speak h2 just like
 // request traffic — otherwise every h2 edge (CloudFront, Aliyun) fails to vet.
