@@ -168,7 +168,7 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 	applied := false
 	if persisted := c.loadPersistedConfig(); persisted != nil {
 		if err := c.applyConfig(persisted); err != nil {
-			c.log.Warn("Persisted config failed to apply, falling back to seed", "error", err)
+			c.log.Warn("Persisted config failed to apply, falling back to seed", "path", c.configCachePath, "error", err)
 		} else {
 			applied = true
 		}
