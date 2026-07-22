@@ -481,8 +481,8 @@ func (c *Client) fetchAndApplyConfig() {
 }
 
 // loadPersistedConfig returns the config saved by a prior successful fetch, or
-// nil when none is configured/present or it can't be read or parsed. The read
-// is size-bounded by ParseConfigFromReader. See WithConfigCacheFile.
+// nil when none is configured/present or it can't be read or parsed. See
+// WithConfigCacheFile.
 func (c *Client) loadPersistedConfig() *Config {
 	if c.configCachePath == "" {
 		return nil
