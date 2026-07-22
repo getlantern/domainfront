@@ -61,8 +61,9 @@ type Client struct {
 	cacheSaveInterval time.Duration
 	cacheDirty        chan struct{}
 
-	configURL  string
-	httpClient *http.Client
+	configURL       string
+	configCachePath string
+	httpClient      *http.Client
 
 	crawlerConcurrency int
 	readyQueueSize     int
@@ -77,6 +78,13 @@ func WithDialer(d Dialer) Option             { return func(c *Client) { c.dialer
 func WithCountryCode(cc string) Option       { return func(c *Client) { c.countryCode = cc } }
 func WithDefaultProviderID(id string) Option { return func(c *Client) { c.defaultPID = id } }
 func WithConfigURL(url string) Option        { return func(c *Client) { c.configURL = url } }
+
+// WithConfigCacheFile persists each successfully fetched config to path and, on
+// the next start, bootstraps from it in preference to the seed config passed to
+// New. This lets a client that fetched a fresher config before going offline
+// keep using it across restarts instead of reverting to the (typically embedded)
+// seed. Requires WithConfigURL to actually refresh the cache.
+func WithConfigCacheFile(path string) Option { return func(c *Client) { c.configCachePath = path } }
 func WithHTTPClient(hc *http.Client) Option  { return func(c *Client) { c.httpClient = hc } }
 func WithCache(cache Cache) Option           { return func(c *Client) { c.cache = cache } }
 func WithMaxRetries(n int) Option            { return func(c *Client) { c.maxRetries = n } }
@@ -150,9 +158,26 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 	// Create pool after options are applied so readyQueueSize can be set
 	c.pool = newFrontPool(c.readyQueueSize)
 
-	if err := c.applyConfig(config); err != nil {
-		cancel()
-		return nil, fmt.Errorf("invalid config: %w", err)
+	// Prefer a config persisted by a prior successful fetch over the seed
+	// (typically embedded): a device that fetched a fresher config before going
+	// offline should keep using it. The config updater refreshes it in the
+	// background when configURL is reachable. A persisted config that parses but
+	// won't apply (e.g. a torn write that decompresses to YAML with no providers)
+	// must not fail construction — fall back to the seed, the caller's known-good
+	// baseline, and only fail if that too is invalid.
+	applied := false
+	if persisted := c.loadPersistedConfig(); persisted != nil {
+		if err := c.applyConfig(persisted); err != nil {
+			c.log.Warn("Persisted config failed to apply, falling back to seed", "path", c.configCachePath, "error", err)
+		} else {
+			applied = true
+		}
+	}
+	if !applied {
+		if err := c.applyConfig(config); err != nil {
+			cancel()
+			return nil, fmt.Errorf("invalid config: %w", err)
+		}
 	}
 
 	// Load cached state
@@ -450,6 +475,45 @@ func (c *Client) fetchAndApplyConfig() {
 	c.log.Info("Applying updated config", "providers", len(cfg.Providers))
 	if err := c.applyConfig(cfg); err != nil {
 		c.log.Warn("Failed to apply config update", "error", err)
+		return
+	}
+	c.persistConfig(data)
+}
+
+// loadPersistedConfig returns the config saved by a prior successful fetch, or
+// nil when none is configured/present or it can't be read or parsed. See
+// WithConfigCacheFile.
+func (c *Client) loadPersistedConfig() *Config {
+	if c.configCachePath == "" {
+		return nil
+	}
+	f, err := os.Open(c.configCachePath)
+	if err != nil {
+		// A missing cache is the normal first-run case; anything else (e.g. a
+		// permission problem) is worth surfacing before falling back to the seed.
+		if !os.IsNotExist(err) {
+			c.log.Warn("Failed to open persisted config, using seed", "path", c.configCachePath, "error", err)
+		}
+		return nil
+	}
+	defer f.Close()
+	cfg, err := ParseConfigFromReader(f)
+	if err != nil {
+		c.log.Warn("Ignoring unparseable persisted config", "path", c.configCachePath, "error", err)
+		return nil
+	}
+	c.log.Debug("Bootstrapped from persisted config", "path", c.configCachePath, "providers", len(cfg.Providers))
+	return cfg
+}
+
+// persistConfig writes the freshly fetched config so the next start can boot
+// from it. Best-effort — a failure only means a colder next start.
+func (c *Client) persistConfig(data []byte) {
+	if c.configCachePath == "" {
+		return
+	}
+	if err := writeFile(c.configCachePath, data); err != nil {
+		c.log.Warn("Failed to persist config cache", "path", c.configCachePath, "error", err)
 	}
 }
 
