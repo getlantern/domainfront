@@ -146,15 +146,17 @@ func TestFetchAndApplyConfig_PersistsOnSuccess(t *testing.T) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	// configUpdater fetches on startup; wait for the cache to be written.
+	// configUpdater fetches on startup; wait until the config is persisted AND
+	// fully parseable with the fetched provider. A bare os.Stat existence check
+	// would race writeFile's non-atomic write and could read a partial file.
 	require.Eventually(t, func() bool {
-		_, statErr := os.Stat(path)
-		return statErr == nil
-	}, 3*time.Second, 20*time.Millisecond, "a successful fetch should persist the config")
-
-	got := c.loadPersistedConfig()
-	require.NotNil(t, got)
-	assert.Contains(t, got.Providers, "fetchedprovider")
+		got := c.loadPersistedConfig()
+		if got == nil {
+			return false
+		}
+		_, ok := got.Providers["fetchedprovider"]
+		return ok
+	}, 3*time.Second, 20*time.Millisecond, "a successful fetch should persist a parseable config with the fetched provider")
 }
 
 func TestNew_IgnoresCorruptCache(t *testing.T) {
