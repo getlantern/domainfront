@@ -480,6 +480,11 @@ func (c *Client) loadPersistedConfig() *Config {
 	}
 	f, err := os.Open(c.configCachePath)
 	if err != nil {
+		// A missing cache is the normal first-run case; anything else (e.g. a
+		// permission problem) is worth surfacing before falling back to the seed.
+		if !os.IsNotExist(err) {
+			c.log.Warn("Failed to open persisted config, using seed", "path", c.configCachePath, "error", err)
+		}
 		return nil
 	}
 	defer f.Close()
