@@ -28,6 +28,10 @@ const (
 	defaultCrawlerConcurrency  = 10
 	defaultProviderID          = "cloudfront"
 	maxConfigSize              = 50 << 20 // 50 MB
+	// defaultConfigFetchTimeout bounds a whole config-refresh race so a hung
+	// source (e.g. a timeout-less HTTP client on a black-holed connection) can't
+	// stall the updater goroutine indefinitely.
+	defaultConfigFetchTimeout = 60 * time.Second
 )
 
 // Client is the main entry point for domain fronting. It manages a pool of
@@ -82,7 +86,11 @@ func WithDefaultProviderID(id string) Option { return func(c *Client) { c.defaul
 // several are given they are fetched concurrently and the first valid response
 // wins, so a blocked or slow mirror (e.g. a GitHub raw URL in a censored
 // region) doesn't hold up a reachable one.
-func WithConfigURL(urls ...string) Option { return func(c *Client) { c.configURLs = urls } }
+func WithConfigURL(urls ...string) Option {
+	// Clone: the caller may pass a slice via WithConfigURL(s...) and later mutate
+	// it, which would otherwise race the config-updater goroutine reading it.
+	return func(c *Client) { c.configURLs = append([]string(nil), urls...) }
+}
 
 // WithConfigCacheFile persists each successfully fetched config to path and, on
 // the next start, bootstraps from it in preference to the seed config passed to
@@ -455,9 +463,11 @@ func (c *Client) fetchAndApplyConfig() {
 		return
 	}
 
-	// Share a cancellable context so that once one source wins, the losers'
-	// in-flight fetches are cancelled promptly (via the deferred cancel).
-	ctx, cancel := context.WithCancel(c.ctx)
+	// Bound the whole race: a shared context with a timeout so a hung source
+	// (timeout-less client on a black-holed connection) can't stall the updater,
+	// and an explicit cancel once a config is applied stops the losers' in-flight
+	// fetches immediately rather than at function return.
+	ctx, cancel := context.WithTimeout(c.ctx, defaultConfigFetchTimeout)
 	defer cancel()
 
 	type fetched struct {
@@ -483,18 +493,20 @@ func (c *Client) fetchAndApplyConfig() {
 		if r == nil {
 			continue // this source failed; wait for another
 		}
-		c.log.Info("Applying updated config", "url", r.url, "providers", len(r.cfg.Providers))
 		if err := c.applyConfig(r.cfg); err != nil {
 			// Parseable but unusable (e.g. no providers). Don't give up — a
 			// backup mirror exists precisely to cover for a corrupt source, so
-			// keep reading the remaining results.
-			c.log.Warn("Failed to apply config update", "url", r.url, "error", err)
+			// keep reading the remaining results. Debug, not Warn: per-source
+			// failures are expected when racing; the total failure warns once below.
+			c.log.Debug("Fetched config failed to apply, trying next source", "url", r.url, "error", err)
 			continue
 		}
+		cancel() // a config applied — stop the losers' in-flight fetches now
 		c.persistConfig(r.data)
-		return // first valid config wins; the deferred cancel stops the losers
+		c.log.Info("Applied updated config", "url", r.url, "providers", len(r.cfg.Providers))
+		return
 	}
-	c.log.Warn("Failed to fetch config from any source", "urls", c.configURLs)
+	c.log.Warn("No source produced a usable config", "urls", c.configURLs)
 }
 
 // fetchConfigFrom fetches and parses the config from a single URL, returning nil
