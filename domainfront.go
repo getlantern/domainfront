@@ -161,14 +161,23 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 	// Prefer a config persisted by a prior successful fetch over the seed
 	// (typically embedded): a device that fetched a fresher config before going
 	// offline should keep using it. The config updater refreshes it in the
-	// background when configURL is reachable.
-	initial := config
+	// background when configURL is reachable. A persisted config that parses but
+	// won't apply (e.g. a torn write that decompresses to YAML with no providers)
+	// must not fail construction — fall back to the seed, the caller's known-good
+	// baseline, and only fail if that too is invalid.
+	applied := false
 	if persisted := c.loadPersistedConfig(); persisted != nil {
-		initial = persisted
+		if err := c.applyConfig(persisted); err != nil {
+			c.log.Warn("Persisted config failed to apply, falling back to seed", "error", err)
+		} else {
+			applied = true
+		}
 	}
-	if err := c.applyConfig(initial); err != nil {
-		cancel()
-		return nil, fmt.Errorf("invalid config: %w", err)
+	if !applied {
+		if err := c.applyConfig(config); err != nil {
+			cancel()
+			return nil, fmt.Errorf("invalid config: %w", err)
+		}
 	}
 
 	// Load cached state

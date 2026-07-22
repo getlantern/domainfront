@@ -104,6 +104,25 @@ func TestNew_FallsBackToSeedWhenNoCache(t *testing.T) {
 	assert.True(t, hasProvider(c, "seedprovider"), "seed config should be used when no cache exists")
 }
 
+// TestNew_FallsBackWhenPersistedConfigInvalid covers a persisted cache that
+// parses as YAML but is semantically invalid for applyConfig (no providers) —
+// e.g. a torn write. It must fall back to the seed, not fail construction.
+func TestNew_FallsBackWhenPersistedConfigInvalid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fronted_config.yaml.gz")
+	// Valid gzip + valid YAML, but zero providers → applyConfig rejects it.
+	noProviders, err := CompressConfig([]byte("providers: {}\n"))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, noProviders, 0o600))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c, err := New(ctx, seedConfig("seedprovider"), WithConfigCacheFile(path), WithDialer(noDialer{}))
+	require.NoError(t, err, "a parseable-but-invalid persisted config must not fail New")
+	defer c.Close()
+
+	assert.True(t, hasProvider(c, "seedprovider"), "should fall back to the seed when the persisted config won't apply")
+}
+
 // TestFetchAndApplyConfig_PersistsOnSuccess exercises the full path: the
 // startup fetch (configUpdater) applies the config to the pool AND writes it to
 // the config cache, so the invariant "a successful fetch warms the cache" is
