@@ -124,7 +124,7 @@ providers:
 | `WithCacheFile(path)` | Path for persistent front cache | No caching |
 | `WithCache(cache)` | Custom `Cache` implementation | `NopCache` |
 | `WithCountryCode(cc)` | Country code for SNI selection | `""` (use default SNI config) |
-| `WithConfigURL(url)` | URL to fetch config updates from | No auto-update |
+| `WithConfigURL(urls...)` | One or more URLs to fetch config updates from; multiple are raced and the first valid response wins | No auto-update |
 | `WithHTTPClient(client)` | HTTP client for config fetches | `http.DefaultClient` |
 | `WithDialer(dialer)` | Custom TCP dialer | `net.Dialer{}` |
 | `WithClientHelloID(id)` | utls Client Hello fingerprint | `HelloChrome_131` |
@@ -191,7 +191,7 @@ fileutil.go       File read/write helpers
 | `f.NewConnectedRoundTripper(ctx, addr)` | `client.RoundTripper()` (reusable) |
 | `fronted.SetLogger(logger)` | `domainfront.WithLogger(logger)` |
 | `fronted.WithCacheFile(path)` | `domainfront.WithCacheFile(path)` |
-| `fronted.WithConfigURL(url)` | `domainfront.WithConfigURL(url)` |
+| `fronted.WithConfigURL(url)` | `domainfront.WithConfigURL(urls...)` (variadic; a single URL works as before) |
 | Global `log` variable | Per-client `*slog.Logger` |
 | `stopCh` / `cacheClosed` / `sync.Once` | Single `context.Context` |
 | `threadSafeFronts.addFronts()` (append-only) | `frontPool.Replace()` (atomic swap) |

@@ -159,6 +159,105 @@ func TestFetchAndApplyConfig_PersistsOnSuccess(t *testing.T) {
 	}, 3*time.Second, 20*time.Millisecond, "a successful fetch should persist a parseable config with the fetched provider")
 }
 
+// TestWithConfigURL_FiltersEmpty verifies WithConfigURL drops empty strings and
+// copies into a fresh slice, so WithConfigURL("") leaves no URLs (no doomed
+// updater) and a passed slice isn't aliased.
+func TestWithConfigURL_FiltersEmpty(t *testing.T) {
+	var c Client
+	WithConfigURL("", "https://a/cfg", "")(&c)
+	assert.Equal(t, []string{"https://a/cfg"}, c.configURLs)
+
+	WithConfigURL("")(&c)
+	assert.Empty(t, c.configURLs, "an empty URL must not enable the updater")
+
+	src := []string{"https://b/cfg"}
+	WithConfigURL(src...)(&c)
+	src[0] = "https://mutated/cfg"
+	assert.Equal(t, []string{"https://b/cfg"}, c.configURLs, "stored URLs must not alias the caller's slice")
+}
+
+// TestFetchAndApplyConfig_RacesToFirstValidSource verifies that with multiple
+// config URLs, a failing source (listed first) doesn't block a reachable one —
+// the valid config wins and is applied.
+func TestFetchAndApplyConfig_RacesToFirstValidSource(t *testing.T) {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzConfig(t, "racedprovider"))
+	}))
+	defer good.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Failing source first: it must not hold up the reachable one.
+	c, err := New(ctx, seedConfig("seedprovider"),
+		WithConfigURL(bad.URL, good.URL), WithDialer(noDialer{}))
+	require.NoError(t, err)
+	defer c.Close()
+
+	require.Eventually(t, func() bool { return hasProvider(c, "racedprovider") },
+		3*time.Second, 20*time.Millisecond, "the reachable source's config should be applied")
+}
+
+// TestFetchAndApplyConfig_SkipsUnapplyableSource verifies that a source serving
+// a parseable but unusable config (zero providers → applyConfig fails) doesn't
+// abort the race: a later valid source is still applied. The empty source
+// responds immediately and the good one is delayed, so the empty result is read
+// first and must be skipped (not treated as terminal).
+func TestFetchAndApplyConfig_SkipsUnapplyableSource(t *testing.T) {
+	emptyCfg, err := CompressConfig([]byte("providers: {}\n"))
+	require.NoError(t, err)
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(emptyCfg)
+	}))
+	defer empty.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond) // lose the arrival race on purpose
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzConfig(t, "goodprovider"))
+	}))
+	defer good.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c, err := New(ctx, seedConfig("seedprovider"),
+		WithConfigURL(empty.URL, good.URL), WithDialer(noDialer{}))
+	require.NoError(t, err)
+	defer c.Close()
+
+	require.Eventually(t, func() bool { return hasProvider(c, "goodprovider") },
+		3*time.Second, 20*time.Millisecond,
+		"an unapplyable source must not prevent a later valid one from being applied")
+}
+
+// TestFetchAndApplyConfig_AllSourcesFailKeepsSeed verifies that when every
+// config source fails, construction still succeeds and the seed config is
+// retained (the failing updater can't replace it).
+func TestFetchAndApplyConfig_AllSourcesFailKeepsSeed(t *testing.T) {
+	bad1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer bad1.Close()
+	bad2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer bad2.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c, err := New(ctx, seedConfig("seedprovider"),
+		WithConfigURL(bad1.URL, bad2.URL), WithDialer(noDialer{}))
+	require.NoError(t, err, "all sources failing must not fail construction")
+	defer c.Close()
+
+	// The seed is applied synchronously in New; a failing updater never replaces it.
+	assert.True(t, hasProvider(c, "seedprovider"))
+}
+
 func TestNew_IgnoresCorruptCache(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fronted_config.yaml.gz")
 	require.NoError(t, os.WriteFile(path, []byte("garbage"), 0o600))
