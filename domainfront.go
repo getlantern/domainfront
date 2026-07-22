@@ -61,7 +61,7 @@ type Client struct {
 	cacheSaveInterval time.Duration
 	cacheDirty        chan struct{}
 
-	configURL       string
+	configURLs      []string
 	configCachePath string
 	httpClient      *http.Client
 
@@ -77,7 +77,12 @@ func WithLogger(l *slog.Logger) Option       { return func(c *Client) { c.log = 
 func WithDialer(d Dialer) Option             { return func(c *Client) { c.dialer = d } }
 func WithCountryCode(cc string) Option       { return func(c *Client) { c.countryCode = cc } }
 func WithDefaultProviderID(id string) Option { return func(c *Client) { c.defaultPID = id } }
-func WithConfigURL(url string) Option        { return func(c *Client) { c.configURL = url } }
+
+// WithConfigURL sets one or more URLs the config updater fetches from. When
+// several are given they are fetched concurrently and the first valid response
+// wins, so a blocked or slow mirror (e.g. a GitHub raw URL in a censored
+// region) doesn't hold up a reachable one.
+func WithConfigURL(urls ...string) Option { return func(c *Client) { c.configURLs = urls } }
 
 // WithConfigCacheFile persists each successfully fetched config to path and, on
 // the next start, bootstraps from it in preference to the seed config passed to
@@ -161,7 +166,7 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 	// Prefer a config persisted by a prior successful fetch over the seed
 	// (typically embedded): a device that fetched a fresher config before going
 	// offline should keep using it. The config updater refreshes it in the
-	// background when configURL is reachable. A persisted config that parses but
+	// background when a config URL is reachable. A persisted config that parses but
 	// won't apply (e.g. a torn write that decompresses to YAML with no providers)
 	// must not fail construction — fall back to the seed, the caller's known-good
 	// baseline, and only fail if that too is invalid.
@@ -195,7 +200,7 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 	go c.crawler()
 	go c.cacheSaver()
 
-	if c.configURL != "" {
+	if len(c.configURLs) > 0 {
 		c.wg.Add(1)
 		go c.configUpdater()
 	}
@@ -441,43 +446,88 @@ func (c *Client) configUpdater() {
 	}
 }
 
+// fetchAndApplyConfig fetches the config from all configured URLs concurrently,
+// applies the first valid response, and persists it. Racing means a blocked or
+// slow source (e.g. a GitHub raw URL in a censored region) can't hold up a
+// reachable mirror.
 func (c *Client) fetchAndApplyConfig() {
-	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.configURL, nil)
-	if err != nil {
-		c.log.Warn("Failed to create config request", "error", err)
+	if len(c.configURLs) == 0 {
 		return
 	}
 
+	// Share a cancellable context so that once one source wins, the losers'
+	// in-flight fetches are cancelled promptly (via the deferred cancel).
+	ctx, cancel := context.WithCancel(c.ctx)
+	defer cancel()
+
+	type fetched struct {
+		url  string
+		data []byte
+		cfg  *Config
+	}
+	// Buffered so a losing goroutine can always send and exit after we've
+	// returned with a winner, rather than leaking on the send.
+	results := make(chan *fetched, len(c.configURLs))
+	for _, url := range c.configURLs {
+		go func(url string) {
+			if data, cfg := c.fetchConfigFrom(ctx, url); cfg != nil {
+				results <- &fetched{url, data, cfg}
+			} else {
+				results <- nil
+			}
+		}(url)
+	}
+
+	for range c.configURLs {
+		r := <-results
+		if r == nil {
+			continue // this source failed; wait for another
+		}
+		c.log.Info("Applying updated config", "url", r.url, "providers", len(r.cfg.Providers))
+		if err := c.applyConfig(r.cfg); err != nil {
+			// Parseable but unusable (e.g. no providers). Don't give up — a
+			// backup mirror exists precisely to cover for a corrupt source, so
+			// keep reading the remaining results.
+			c.log.Warn("Failed to apply config update", "url", r.url, "error", err)
+			continue
+		}
+		c.persistConfig(r.data)
+		return // first valid config wins; the deferred cancel stops the losers
+	}
+	c.log.Warn("Failed to fetch config from any source", "urls", c.configURLs)
+}
+
+// fetchConfigFrom fetches and parses the config from a single URL, returning nil
+// on any failure. Failures are logged at debug because, when racing several
+// sources, a blocked or slow mirror is expected; a total failure is logged once
+// by the caller. The returned bytes are the raw config for persistence.
+func (c *Client) fetchConfigFrom(ctx context.Context, url string) ([]byte, *Config) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		c.log.Debug("Failed to create config request", "url", url, "error", err)
+		return nil, nil
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		c.log.Warn("Failed to fetch config", "url", c.configURL, "error", err)
-		return
+		c.log.Debug("Failed to fetch config", "url", url, "error", err)
+		return nil, nil
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		c.log.Warn("Config fetch returned non-200 status", "status", resp.StatusCode)
-		return
+		c.log.Debug("Config fetch returned non-200 status", "url", url, "status", resp.StatusCode)
+		return nil, nil
 	}
-
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxConfigSize))
 	if err != nil {
-		c.log.Warn("Failed to read config response", "error", err)
-		return
+		c.log.Debug("Failed to read config response", "url", url, "error", err)
+		return nil, nil
 	}
-
 	cfg, err := ParseConfig(data)
 	if err != nil {
-		c.log.Warn("Failed to parse config", "error", err)
-		return
+		c.log.Debug("Failed to parse config", "url", url, "error", err)
+		return nil, nil
 	}
-
-	c.log.Info("Applying updated config", "providers", len(cfg.Providers))
-	if err := c.applyConfig(cfg); err != nil {
-		c.log.Warn("Failed to apply config update", "error", err)
-		return
-	}
-	c.persistConfig(data)
+	return data, cfg
 }
 
 // loadPersistedConfig returns the config saved by a prior successful fetch, or
