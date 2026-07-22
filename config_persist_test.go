@@ -159,6 +159,23 @@ func TestFetchAndApplyConfig_PersistsOnSuccess(t *testing.T) {
 	}, 3*time.Second, 20*time.Millisecond, "a successful fetch should persist a parseable config with the fetched provider")
 }
 
+// TestWithConfigURL_FiltersEmpty verifies WithConfigURL drops empty strings and
+// copies into a fresh slice, so WithConfigURL("") leaves no URLs (no doomed
+// updater) and a passed slice isn't aliased.
+func TestWithConfigURL_FiltersEmpty(t *testing.T) {
+	var c Client
+	WithConfigURL("", "https://a/cfg", "")(&c)
+	assert.Equal(t, []string{"https://a/cfg"}, c.configURLs)
+
+	WithConfigURL("")(&c)
+	assert.Empty(t, c.configURLs, "an empty URL must not enable the updater")
+
+	src := []string{"https://b/cfg"}
+	WithConfigURL(src...)(&c)
+	src[0] = "https://mutated/cfg"
+	assert.Equal(t, []string{"https://b/cfg"}, c.configURLs, "stored URLs must not alias the caller's slice")
+}
+
 // TestFetchAndApplyConfig_RacesToFirstValidSource verifies that with multiple
 // config URLs, a failing source (listed first) doesn't block a reachable one —
 // the valid config wins and is applied.

@@ -31,7 +31,7 @@ const (
 	// defaultConfigFetchTimeout bounds a whole config-refresh race so a hung
 	// source (e.g. a timeout-less HTTP client on a black-holed connection) can't
 	// stall the updater goroutine indefinitely.
-	defaultConfigFetchTimeout = 60 * time.Second
+	defaultConfigFetchTimeout = 20 * time.Second
 )
 
 // Client is the main entry point for domain fronting. It manages a pool of
@@ -87,9 +87,18 @@ func WithDefaultProviderID(id string) Option { return func(c *Client) { c.defaul
 // wins, so a blocked or slow mirror (e.g. a GitHub raw URL in a censored
 // region) doesn't hold up a reachable one.
 func WithConfigURL(urls ...string) Option {
-	// Clone: the caller may pass a slice via WithConfigURL(s...) and later mutate
-	// it, which would otherwise race the config-updater goroutine reading it.
-	return func(c *Client) { c.configURLs = append([]string(nil), urls...) }
+	// Copy into a fresh slice (a caller may pass and later mutate a slice, racing
+	// the updater) and drop empty strings, so WithConfigURL("") leaves configURLs
+	// empty — matching "no auto-update" — rather than starting a doomed updater.
+	return func(c *Client) {
+		filtered := make([]string, 0, len(urls))
+		for _, u := range urls {
+			if u != "" {
+				filtered = append(filtered, u)
+			}
+		}
+		c.configURLs = filtered
+	}
 }
 
 // WithConfigCacheFile persists each successfully fetched config to path and, on
@@ -529,9 +538,16 @@ func (c *Client) fetchConfigFrom(ctx context.Context, url string) ([]byte, *Conf
 		c.log.Debug("Config fetch returned non-200 status", "url", url, "status", resp.StatusCode)
 		return nil, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxConfigSize))
+	// Read one past the cap so an oversized body is detected and rejected rather
+	// than silently truncated (gzip ignores trailing bytes, so a truncated body
+	// with a valid prefix would otherwise parse). Matches ParseConfigFromReader.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxConfigSize+1))
 	if err != nil {
 		c.log.Debug("Failed to read config response", "url", url, "error", err)
+		return nil, nil
+	}
+	if len(data) > maxConfigSize {
+		c.log.Debug("Config response exceeds size cap", "url", url, "cap", maxConfigSize)
 		return nil, nil
 	}
 	cfg, err := ParseConfig(data)
