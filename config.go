@@ -26,18 +26,24 @@ type CA struct {
 }
 
 // Provider is a domain fronting provider (e.g. Akamai, CloudFront).
+//
+// Every tag below must match the published fronted.yaml.gz byte for byte.
+// Matching is case-sensitive, and a key that misses simply leaves its field
+// zero-valued — no error — so a wrong tag disables a feature silently.
+// TestWireKeysAreClaimed pins the tags against the real artifact.
+//
+// The generator marshals flashlight's config.ProviderConfig, whose fields carry
+// no yaml tags, so keys arrive as lowercase-concatenated Go field names.
+// VerifyHostname is the lone exception: it has an explicit camelCase tag
+// upstream, which is why it looks out of place next to its lowercase siblings
+// and next to Masquerade.VerifyHostname.
 type Provider struct {
-	HostAliases         map[string]string `yaml:"hostaliases"`
-	PassthroughPatterns []string          `yaml:"passthrupatterns"`
-	TestURL             string            `yaml:"testurl"`
-	Masquerades         []*Masquerade     `yaml:"masquerades"`
-	VerifyHostname      *string           `yaml:"verifyhostname"`
-	// Pipeline-emitted YAML keys are lowercase-concatenated, not
-	// snake_case (the upstream generator uses lowercased Go field
-	// names with no yaml tag); the tag here must match the wire
-	// format exactly or yaml.Unmarshal silently leaves the field
-	// zero-valued.
-	FrontingSNIs map[string]*SNIConfig `yaml:"frontingsnis"`
+	HostAliases         map[string]string     `yaml:"hostaliases"`
+	PassthroughPatterns []string              `yaml:"passthroughpatterns"`
+	TestURL             string                `yaml:"testurl"`
+	Masquerades         []*Masquerade         `yaml:"masquerades"`
+	VerifyHostname      *string               `yaml:"verifyHostname"`
+	FrontingSNIs        map[string]*SNIConfig `yaml:"frontingsnis"`
 }
 
 // SNIConfig controls SNI generation for a specific country or "default".
