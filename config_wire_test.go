@@ -16,11 +16,14 @@ import (
 
 // unmodeledKeys are keys the generator publishes that we deliberately do not
 // parse. Anything here is invisible to this package by choice, not by accident.
+// Keyed by the struct the exception applies to, so an unmodeled key appearing at
+// an unexpected level still fails.
 //
-//   - validator: flashlight's per-provider response validator (rejectstatus).
-//     Enforced by flashlight clients; domainfront does not act on it.
-var unmodeledKeys = map[string]bool{
-	"validator": true,
+//   - Provider.validator: flashlight's per-provider response validator
+//     (rejectstatus). Enforced by flashlight clients; domainfront does not act
+//     on it.
+var unmodeledKeys = map[reflect.Type]map[string]bool{
+	reflect.TypeOf(Provider{}): {"validator": true},
 }
 
 // TestWireKeysAreClaimed compares the keys in the real published fronted.yaml.gz
@@ -41,39 +44,35 @@ func TestWireKeysAreClaimed(t *testing.T) {
 	var tree map[string]any
 	require.NoError(t, yaml.Unmarshal(raw, &tree))
 
-	assertClaimed(t, "(root)", tree, reflect.TypeOf(Config{}))
+	assertClaimed(t, "(root)", []map[string]any{tree}, reflect.TypeOf(Config{}))
 
 	providers, ok := tree["providers"].(map[string]any)
 	require.True(t, ok, "published config has no providers map")
 	require.NotEmpty(t, providers)
 
+	masqueradesChecked := 0
 	for name, p := range providers {
 		provider, ok := p.(map[string]any)
 		require.Truef(t, ok, "provider %q is not a mapping", name)
-		assertClaimed(t, "providers."+name, provider, reflect.TypeOf(Provider{}))
+		assertClaimed(t, "providers."+name, []map[string]any{provider}, reflect.TypeOf(Provider{}))
 
-		for i, m := range asSlice(provider["masquerades"]) {
-			masq, ok := m.(map[string]any)
-			require.Truef(t, ok, "%s.masquerades[%d] is not a mapping", name, i)
-			assertClaimed(t, name+".masquerades[]", masq, reflect.TypeOf(Masquerade{}))
-			break // homogeneous; one sample per provider keeps the failure readable
-		}
+		masquerades := mappings(t, name+".masquerades", asSlice(provider["masquerades"]))
+		assertClaimed(t, name+".masquerades[]", masquerades, reflect.TypeOf(Masquerade{}))
+		masqueradesChecked += len(masquerades)
 
-		snis, _ := provider["frontingsnis"].(map[string]any)
-		for country, s := range snis {
-			sni, ok := s.(map[string]any)
-			require.Truef(t, ok, "%s.frontingsnis.%s is not a mapping", name, country)
-			assertClaimed(t, name+".frontingsnis[]", sni, reflect.TypeOf(SNIConfig{}))
-			break
-		}
+		assertClaimed(t, name+".frontingsnis[]",
+			mappings(t, name+".frontingsnis", values(provider["frontingsnis"])),
+			reflect.TypeOf(SNIConfig{}))
 	}
+	// Every entry is checked rather than a sample per provider. The generator
+	// marshals a tagless struct, so in practice all masquerades carry the same
+	// keys, but that is the generator's business — the point of this test is to
+	// stop trusting the generator's shape.
+	require.NotZero(t, masqueradesChecked, "no masquerades were checked")
 
-	for i, c := range asSlice(tree["trustedcas"]) {
-		ca, ok := c.(map[string]any)
-		require.Truef(t, ok, "trustedcas[%d] is not a mapping", i)
-		assertClaimed(t, "trustedcas[]", ca, reflect.TypeOf(CA{}))
-		break
-	}
+	assertClaimed(t, "trustedcas[]",
+		mappings(t, "trustedcas", asSlice(tree["trustedcas"])),
+		reflect.TypeOf(CA{}))
 }
 
 // TestPublishedConfigParses is the other half: the keys bind to non-zero values.
@@ -138,14 +137,23 @@ func TestVerifyHostnameCasing(t *testing.T) {
 	require.Equal(t, "a248.e.akamai.net", *m.VerifyHostname)
 }
 
-// assertClaimed fails for any wire key that no field of typ unmarshals from and
-// that isn't listed in unmodeledKeys.
-func assertClaimed(t *testing.T, path string, node map[string]any, typ reflect.Type) {
+// assertClaimed fails for any key across nodes that no field of typ unmarshals
+// from and that isn't excepted for typ in unmodeledKeys. Taking every node at a
+// level rather than a sample keeps coverage total; the tag set is resolved once
+// and unclaimed keys are reported as a set, so 2000+ masquerades cost one pass
+// and produce one readable failure.
+func assertClaimed(t *testing.T, path string, nodes []map[string]any, typ reflect.Type) {
 	t.Helper()
 	claimed := yamlKeys(typ)
+	excepted := unmodeledKeys[typ]
+	seen := make(map[string]bool)
 	var unclaimed []string
-	for k := range node {
-		if !claimed[k] && !unmodeledKeys[k] {
+	for _, node := range nodes {
+		for k := range node {
+			if claimed[k] || excepted[k] || seen[k] {
+				continue
+			}
+			seen[k] = true
 			unclaimed = append(unclaimed, k)
 		}
 	}
@@ -178,9 +186,32 @@ func yamlKeys(typ reflect.Type) map[string]bool {
 	return keys
 }
 
+// mappings asserts every element of vals is a YAML mapping and returns them.
+func mappings(t *testing.T, path string, vals []any) []map[string]any {
+	t.Helper()
+	out := make([]map[string]any, 0, len(vals))
+	for i, v := range vals {
+		m, ok := v.(map[string]any)
+		require.Truef(t, ok, "%s[%d] is not a mapping", path, i)
+		out = append(out, m)
+	}
+	return out
+}
+
 func asSlice(v any) []any {
 	s, _ := v.([]any)
 	return s
+}
+
+// values returns the values of a YAML mapping, discarding the keys — used where
+// the keys are data (country codes) rather than field names.
+func values(v any) []any {
+	m, _ := v.(map[string]any)
+	out := make([]any, 0, len(m))
+	for _, val := range m {
+		out = append(out, val)
+	}
+	return out
 }
 
 func readConfig(t *testing.T) []byte {
