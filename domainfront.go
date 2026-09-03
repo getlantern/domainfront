@@ -70,8 +70,10 @@ type Client struct {
 	httpClient      *http.Client
 
 	crawlerConcurrency int
+	crawlInterval      time.Duration
 	readyQueueSize     int
 	wg                 sync.WaitGroup
+	gate               *pauseGate
 }
 
 // Option configures a Client.
@@ -139,6 +141,12 @@ func WithCacheFile(path string) Option {
 	return func(c *Client) { c.cache = &FileCache{Path: path} }
 }
 
+// withCrawlInterval pins the delay between crawl passes, replacing the jittered
+// default, so tests need not wait one out.
+func withCrawlInterval(d time.Duration) Option {
+	return func(c *Client) { c.crawlInterval = d }
+}
+
 // New creates a new domain fronting Client and starts background goroutines.
 // The provided config is the initial (typically embedded) configuration.
 // Pass a cancellable context to control the Client's lifetime, or call Close().
@@ -166,6 +174,7 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 		cacheDirty:         make(chan struct{}, 1),
 		httpClient:         http.DefaultClient,
 		crawlerConcurrency: defaultCrawlerConcurrency,
+		gate:               newPauseGate(),
 	}
 
 	for _, opt := range options {
@@ -303,6 +312,18 @@ func (c *Client) notifyCacheDirty() {
 	}
 }
 
+// returnAfterDialFailure requeues f untouched while paused — a failed dial then
+// says nothing about the front (no route, or a sleeping device) — and otherwise
+// drops it from rotation as a failure.
+func (c *Client) returnAfterDialFailure(f *front) {
+	if c.gate.isPaused() {
+		c.pool.Return(f, true)
+		return
+	}
+	c.pool.Return(f, false)
+	c.notifyCacheDirty()
+}
+
 func (c *Client) crawler() {
 	defer c.wg.Done()
 
@@ -317,17 +338,29 @@ func (c *Client) crawler() {
 	defer timer.Stop()
 
 	for {
+		if !c.gate.wait(c.ctx) {
+			return
+		}
 		if c.pool.readyCount() < 2 {
 			c.crawlAllFronts()
 		}
 
-		timer.Reset(time.Duration(6+rand.IntN(7)) * time.Second)
+		timer.Reset(c.nextCrawlDelay())
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-timer.C:
 		}
 	}
+}
+
+// nextCrawlDelay returns the pinned crawlInterval when set, otherwise a
+// jittered wait so a fleet of clients doesn't crawl in lockstep.
+func (c *Client) nextCrawlDelay() time.Duration {
+	if c.crawlInterval > 0 {
+		return c.crawlInterval
+	}
+	return time.Duration(6+rand.IntN(7)) * time.Second
 }
 
 func (c *Client) crawlAllFronts() {
@@ -340,7 +373,7 @@ func (c *Client) crawlAllFronts() {
 	var wg sync.WaitGroup
 
 	for _, f := range candidates {
-		if c.ctx.Err() != nil {
+		if c.ctx.Err() != nil || c.gate.isPaused() {
 			break
 		}
 		if c.pool.readyCount() >= 4 {
@@ -353,7 +386,7 @@ func (c *Client) crawlAllFronts() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			if c.ctx.Err() != nil {
+			if c.ctx.Err() != nil || c.gate.isPaused() {
 				return
 			}
 
@@ -426,6 +459,9 @@ func (c *Client) cacheSaver() {
 		case <-c.ctx.Done():
 			return
 		case <-timer.C:
+			if !c.gate.wait(c.ctx) {
+				return
+			}
 			select {
 			case <-c.cacheDirty:
 				c.saveCache()
@@ -447,7 +483,7 @@ func (c *Client) saveCache() {
 func (c *Client) configUpdater() {
 	defer c.wg.Done()
 
-	// Fetch immediately on startup, then every 12 hours
+	// Fetch eagerly so the first config doesn't wait out a full interval.
 	c.fetchAndApplyConfig()
 
 	ticker := time.NewTicker(12 * time.Hour)

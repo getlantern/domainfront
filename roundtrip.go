@@ -87,12 +87,10 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		result := dialFront(ctx, f, rt.client.certPool(), rt.client.clientHelloID, rt.client.dialer)
 		if result.err != nil {
-			// Dial failures should never be treated as successful fronts. The
-			// front is removed from rotation (markFailed), so retries naturally
-			// move on without needing the provider-diversity hint below — mark
-			// tried only once we actually send a request over this provider.
-			rt.client.pool.Return(f, false)
-			rt.client.notifyCacheDirty()
+			// Leave the provider untried: that hint is for a provider that
+			// connects but won't forward, which a front that never connected is
+			// no evidence of.
+			rt.client.returnAfterDialFailure(f)
 			lastErr = result.err
 			continue
 		}

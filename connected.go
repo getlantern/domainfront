@@ -48,8 +48,7 @@ func (c *Client) NewConnectedRoundTripper(ctx context.Context, addr string) (htt
 
 		result := dialFront(ctx, f, c.certPool(), c.clientHelloID, c.dialer)
 		if result.err != nil {
-			c.pool.Return(f, false)
-			c.notifyCacheDirty()
+			c.returnAfterDialFailure(f)
 			lastErr = fmt.Errorf("dial front %s: %w", f.Domain, result.err)
 			continue
 		}
