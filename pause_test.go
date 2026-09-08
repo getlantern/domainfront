@@ -349,10 +349,14 @@ func TestClient_DialFailureDropsFrontWhenRunning(t *testing.T) {
 	client, err := New(ctx, manyFrontsConfig(1),
 		WithDialer(dialer),
 		WithMaxRetries(3),
+		withCrawlInterval(time.Hour),
 	)
 	require.NoError(t, err)
 	defer client.Close()
 
+	// Let the crawler's first pass settle before seeding, so its markFailed
+	// can't be what drops the front instead of returnAfterDialFailure.
+	waitForStableCount(t, dialer.dials.Load)
 	f := seedReadyFront(t, client)
 
 	// Once the front is dropped, the second retry's Take blocks on an empty
