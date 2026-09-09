@@ -270,3 +270,60 @@ func TestNew_IgnoresCorruptCache(t *testing.T) {
 
 	assert.True(t, hasProvider(c, "seedprovider"), "seed config should be used when the cache is corrupt")
 }
+
+func TestFetchAndApplyConfig_PausedRefreshPreservesReadyFronts(t *testing.T) {
+	for _, finish := range []string{"resume", "cancel"} {
+		t.Run(finish, func(t *testing.T) {
+			payload := gzConfig(t, "test")
+			fetched := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write(payload)
+				close(fetched)
+			}))
+			defer server.Close()
+			// Start paused so no crawler can interfere with the seeded ready front.
+			c, err := New(context.Background(), seedConfig("test"), WithDialer(noDialer{}),
+				func(c *Client) { c.gate.pause() })
+			require.NoError(t, err)
+			defer c.Close()
+			f := seedReadyFront(t, c)
+			// Run one refresh explicitly so completion is observable, even though the
+			// fetched config contains exactly the same fronts as the seed.
+			c.configURLs = []string{server.URL}
+			done := make(chan struct{})
+			c.wg.Add(1)
+			go func() {
+				defer c.wg.Done()
+				defer close(done)
+				c.fetchAndApplyConfig()
+			}()
+			select {
+			case <-fetched:
+			case <-time.After(time.Second):
+				t.Fatal("config was not fetched")
+			}
+			select {
+			case <-done:
+				t.Fatal("config refresh completed while paused")
+			case <-time.After(50 * time.Millisecond):
+			}
+			require.Equal(t, 1, c.pool.readyCount(), "refresh must leave existing fronts available while paused")
+			require.Same(t, f, c.pool.candidates()[0])
+			if finish == "resume" {
+				c.Resume()
+			} else {
+				c.cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("refresh did not finish on " + finish)
+			}
+			if finish == "resume" {
+				require.NotSame(t, f, c.pool.candidates()[0], "pending config must apply on resume")
+			} else {
+				require.Same(t, f, c.pool.candidates()[0], "shutdown must discard the pending config")
+			}
+		})
+	}
+}

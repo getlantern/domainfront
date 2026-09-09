@@ -538,6 +538,13 @@ func (c *Client) fetchAndApplyConfig() {
 		if r == nil {
 			continue // this source failed; wait for another
 		}
+		// Applying a config drains the ready queue. Keep existing fronts usable
+		// while the crawler is paused, and retain this result until resume.
+		// Use the client lifetime: the fetch timeout must not discard a config
+		// that already arrived, and shutdown must unblock this wait.
+		if !c.gate.wait(c.ctx) {
+			return
+		}
 		if err := c.applyConfig(r.cfg); err != nil {
 			// Parseable but unusable (e.g. no providers). Don't give up — a
 			// backup mirror exists precisely to cover for a corrupt source, so

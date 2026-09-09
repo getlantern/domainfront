@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -368,4 +369,53 @@ func TestClient_DialFailureDropsFrontWhenRunning(t *testing.T) {
 	require.Error(t, err)
 
 	assert.False(t, f.isSucceeding(), "an unpaused dial failure should still drop the front")
+}
+
+// observedWaitContext lets a test order resume/pause before a waiter wakes.
+// Done is evaluated after wait snapshots the gate channel.
+type observedWaitContext struct {
+	context.Context
+	once    sync.Once
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (c *observedWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() {
+		close(c.entered)
+		<-c.proceed
+	})
+	return c.Context.Done()
+}
+
+func TestPauseGate_ResumeThenPauseBeforeWaiterWakes(t *testing.T) {
+	g := newPauseGate()
+	g.pause()
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &observedWaitContext{Context: base, entered: make(chan struct{}), proceed: make(chan struct{})}
+	released := make(chan bool, 1)
+	go func() { released <- g.wait(ctx) }()
+	<-ctx.entered
+	g.resume()
+	g.pause()
+	close(ctx.proceed)
+	select {
+	case <-released:
+		t.Fatal("wait returned through a previous resume while paused again")
+	case <-time.After(50 * time.Millisecond):
+	}
+	g.resume()
+	select {
+	case ok := <-released:
+		require.True(t, ok)
+	case <-time.After(time.Second):
+		t.Fatal("wait did not return after the final resume")
+	}
+}
+
+func TestPauseGate_CanceledWhileRunning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.False(t, newPauseGate().wait(ctx))
 }

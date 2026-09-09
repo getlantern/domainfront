@@ -9,9 +9,9 @@ import (
 // while paused and are released by resume or by their context ending.
 type pauseGate struct {
 	mu sync.Mutex
-	// resumed is closed while running and an open channel while paused, so its
-	// closed-ness is the gate's whole state: a waiter released by the close needs
-	// no re-check, and each paused stretch owns the channel its resume closes.
+	// resumed is closed while running and an open channel while paused. Each
+	// paused stretch owns the channel its resume closes; waiters must recheck
+	// the current channel in case another pause happened before they woke.
 	resumed chan struct{}
 }
 
@@ -54,18 +54,30 @@ func (g *pauseGate) isPaused() bool {
 
 // wait blocks until the gate is resumed, reporting false if ctx ended first.
 func (g *pauseGate) wait(ctx context.Context) bool {
-	g.mu.Lock()
-	resumed := g.resumed
-	g.mu.Unlock()
-	select {
-	case <-resumed:
-		return true
-	case <-ctx.Done():
-		return false
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		g.mu.Lock()
+		resumed := g.resumed
+		select {
+		case <-resumed:
+			g.mu.Unlock()
+			return true
+		default:
+			g.mu.Unlock()
+		}
+		select {
+		case <-resumed:
+			// A later pause may have replaced this channel while we were asleep.
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 
-// Pause suspends the background loops: front crawling and cache persistence. It
+// Pause suspends front crawling, cache persistence, and application of fetched
+// configs. Config downloads may finish, but their results wait for Resume. It
 // suits stretches when background probing cannot succeed or is unwanted — no
 // default route, or a sleeping device — so a whole pass of fronts isn't dialed
 // and marked failed on evidence that says nothing about the fronts.
