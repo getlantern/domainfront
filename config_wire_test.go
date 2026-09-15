@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/goccy/go-yaml"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -231,4 +232,24 @@ func decompress(t *testing.T, gzipped []byte) []byte {
 	raw, err := io.ReadAll(r)
 	require.NoError(t, err)
 	return raw
+}
+
+func TestPublishedConfigIsCompact(t *testing.T) {
+	cfg, err := ParseConfig(readConfig(t))
+	require.NoError(t, err)
+	require.NotEmpty(t, cfg.Providers)
+	require.NotEmpty(t, cfg.TrustedCAs)
+	_, err = cfg.CertPool()
+	require.NoError(t, err)
+	// These limits mirror lantern-cloud publishedconfig/compact.go; raising
+	// them requires coordinating both this guard and Radiance's embedded guard.
+	for name, p := range cfg.Providers {
+		require.NotNil(t, p, name)
+		assert.NotEmpty(t, p.Masquerades, name)
+		assert.LessOrEqual(t, len(p.Masquerades), 200, name)
+		for country, sni := range p.FrontingSNIs {
+			require.NotNil(t, sni, name+"/"+country)
+			assert.LessOrEqual(t, len(sni.ArbitrarySNIs), 256, name+"/"+country)
+		}
+	}
 }
