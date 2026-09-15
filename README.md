@@ -124,7 +124,8 @@ providers:
 | `WithCacheFile(path)` | Path for persistent front cache | No caching |
 | `WithCache(cache)` | Custom `Cache` implementation | `NopCache` |
 | `WithCountryCode(cc)` | Country code for SNI selection | `""` (use default SNI config) |
-| `WithConfigURL(urls...)` | One or more URLs to fetch config updates from; multiple are raced and the first valid response wins | No auto-update |
+| `WithConfigURL(urls...)` | One or more URLs to fetch config updates from; multiple are raced and the first valid changed response wins | No auto-update |
+| `WithConfigCacheFile(path)` | Persist the config plus hash-bound per-URL HTTP validators | No config persistence |
 | `WithHTTPClient(client)` | HTTP client for config fetches | `http.DefaultClient` |
 | `WithDialer(dialer)` | Custom TCP dialer | `net.Dialer{}` |
 | `WithClientHelloID(id)` | utls Client Hello fingerprint | `HelloChrome_131` |
@@ -132,6 +133,27 @@ providers:
 | `WithMaxRetries(n)` | Max round-trip retry attempts | `6` |
 | `WithCrawlerConcurrency(n)` | Parallel front-vetting goroutines | `10` |
 | `WithLogger(logger)` | `*slog.Logger` for diagnostics | `slog.Default()` |
+
+## Conditional config refreshes
+
+`WithConfigURL` sends `If-None-Match` when a URL has supplied an ETag, or
+`If-Modified-Since` when only a Last-Modified timestamp is available. A 304 or a
+200 with identical compressed bytes skips YAML parsing, the pool rebuild, and
+rewriting the cached payload. Each URL has its own validator; ETags from different
+hosts are not interchangeable.
+
+With `WithConfigCacheFile(path)`, validators are saved in `path + ".http.json"`
+and bound to the SHA-256 of the cached gzip file. Missing, malformed, oversized,
+or mismatched metadata falls back to a full GET. A cached config must parse and
+apply successfully before its validators can be reused. Without a cache path,
+validators last only for the client's lifetime.
+
+An unchanged source does not cancel other requests: a mirror may return 304
+while another source has an update. The first usable changed response still
+wins. ETags do not establish freshness between different payloads, so this does
+not prevent an older CDN snapshot from winning that race. Startup still parses
+the cached config once, and callers that parse an embedded seed before `New`
+continue to incur that initial parse.
 
 ## Architecture
 
@@ -175,6 +197,7 @@ providers:
 ```
 domainfront.go    Client, New(), options, background goroutines
 config.go         Config/Provider/Masquerade/CA types, YAML parsing
+config_fetch.go   Conditional refresh, response race, persisted validators
 front.go          front type, frontPool (Take/Return/Replace)
 dialer.go         TLS dialing with utls, cert verification
 roundtrip.go      RoundTripper, request rewriting, retry logic

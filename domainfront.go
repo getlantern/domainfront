@@ -65,9 +65,12 @@ type Client struct {
 	cacheSaveInterval time.Duration
 	cacheDirty        chan struct{}
 
-	configURLs      []string
-	configCachePath string
-	httpClient      *http.Client
+	configURLs       []string
+	configCachePath  string
+	httpClient       *http.Client
+	configMu         sync.Mutex
+	configHash       string
+	configValidators map[string]configValidator
 
 	crawlerConcurrency int
 	crawlInterval      time.Duration
@@ -86,7 +89,8 @@ func WithDefaultProviderID(id string) Option { return func(c *Client) { c.defaul
 
 // WithConfigURL sets one or more URLs the config updater fetches from. When
 // several are given they are fetched concurrently and the first valid response
-// wins, so a blocked or slow mirror (e.g. a GitHub raw URL in a censored
+// with changed content wins. An unchanged response does not cancel other
+// sources, so a blocked or slow mirror (e.g. a GitHub raw URL in a censored
 // region) doesn't hold up a reachable one.
 func WithConfigURL(urls ...string) Option {
 	// Copy into a fresh slice (a caller may pass and later mutate a slice, racing
@@ -107,7 +111,9 @@ func WithConfigURL(urls ...string) Option {
 // the next start, bootstraps from it in preference to the seed config passed to
 // New. This lets a client that fetched a fresher config before going offline
 // keep using it across restarts instead of reverting to the (typically embedded)
-// seed. Requires WithConfigURL to actually refresh the cache.
+// seed. Validators are stored in a hash-bound .http.json sidecar so unchanged
+// refreshes can skip downloading and parsing the config across restarts.
+// Requires WithConfigURL to actually refresh the cache.
 func WithConfigCacheFile(path string) Option { return func(c *Client) { c.configCachePath = path } }
 func WithHTTPClient(hc *http.Client) Option  { return func(c *Client) { c.httpClient = hc } }
 func WithCache(cache Cache) Option           { return func(c *Client) { c.cache = cache } }
@@ -197,11 +203,13 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 	// must not fail construction — fall back to the seed, the caller's known-good
 	// baseline, and only fail if that too is invalid.
 	applied := false
-	if persisted := c.loadPersistedConfig(); persisted != nil {
+	if data, persisted := c.readPersistedConfig(); persisted != nil {
 		if err := c.applyConfig(persisted); err != nil {
 			c.log.Warn("Persisted config failed to apply, falling back to seed", "path", c.configCachePath, "error", err)
 		} else {
 			applied = true
+			c.configHash = configDigest(data)
+			c.loadConfigValidators()
 		}
 	}
 	if !applied {
@@ -266,6 +274,11 @@ func (c *Client) applyConfig(cfg *Config) error {
 		return fmt.Errorf("no providers configured")
 	}
 
+	certPool, err := cfg.CertPool()
+	if err != nil {
+		return fmt.Errorf("cert pool: %w", err)
+	}
+
 	expanded := make(map[string]*Provider, len(cfg.Providers))
 	for id, p := range cfg.Providers {
 		expanded[id] = ExpandedProvider(p, c.countryCode)
@@ -275,10 +288,6 @@ func (c *Client) applyConfig(cfg *Config) error {
 	c.providers = expanded
 	c.providersMu.Unlock()
 
-	certPool, err := cfg.CertPool()
-	if err != nil {
-		return fmt.Errorf("cert pool: %w", err)
-	}
 	c.certPoolValue.Store(certPool)
 
 	var fronts []*front
@@ -499,132 +508,42 @@ func (c *Client) configUpdater() {
 	}
 }
 
-// fetchAndApplyConfig fetches the config from all configured URLs concurrently,
-// applies the first valid response, and persists it. Racing means a blocked or
-// slow source (e.g. a GitHub raw URL in a censored region) can't hold up a
-// reachable mirror.
-func (c *Client) fetchAndApplyConfig() {
-	if len(c.configURLs) == 0 {
-		return
-	}
-
-	// Bound the whole race: a shared context with a timeout so a hung source
-	// (timeout-less client on a black-holed connection) can't stall the updater,
-	// and an explicit cancel once a config is applied stops the losers' in-flight
-	// fetches immediately rather than at function return.
-	ctx, cancel := context.WithTimeout(c.ctx, defaultConfigFetchTimeout)
-	defer cancel()
-
-	type fetched struct {
-		url  string
-		data []byte
-		cfg  *Config
-	}
-	// Buffered so a losing goroutine can always send and exit after we've
-	// returned with a winner, rather than leaking on the send.
-	results := make(chan *fetched, len(c.configURLs))
-	for _, url := range c.configURLs {
-		go func(url string) {
-			if data, cfg := c.fetchConfigFrom(ctx, url); cfg != nil {
-				results <- &fetched{url, data, cfg}
-			} else {
-				results <- nil
-			}
-		}(url)
-	}
-
-	for range c.configURLs {
-		r := <-results
-		if r == nil {
-			continue // this source failed; wait for another
-		}
-		// Applying a config drains the ready queue. Keep existing fronts usable
-		// while the crawler is paused, and retain this result until resume.
-		// Use the client lifetime: the fetch timeout must not discard a config
-		// that already arrived, and shutdown must unblock this wait.
-		if !c.gate.wait(c.ctx) {
-			return
-		}
-		if err := c.applyConfig(r.cfg); err != nil {
-			// Parseable but unusable (e.g. no providers). Don't give up — a
-			// backup mirror exists precisely to cover for a corrupt source, so
-			// keep reading the remaining results. Debug, not Warn: per-source
-			// failures are expected when racing; the total failure warns once below.
-			c.log.Debug("Fetched config failed to apply, trying next source", "url", r.url, "error", err)
-			continue
-		}
-		cancel() // a config applied — stop the losers' in-flight fetches now
-		c.persistConfig(r.data)
-		c.log.Info("Applied updated config", "url", r.url, "providers", len(r.cfg.Providers))
-		return
-	}
-	c.log.Warn("No source produced a usable config", "urls", c.configURLs)
-}
-
-// fetchConfigFrom fetches and parses the config from a single URL, returning nil
-// on any failure. Failures are logged at debug because, when racing several
-// sources, a blocked or slow mirror is expected; a total failure is logged once
-// by the caller. The returned bytes are the raw config for persistence.
-func (c *Client) fetchConfigFrom(ctx context.Context, url string) ([]byte, *Config) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		c.log.Debug("Failed to create config request", "url", url, "error", err)
-		return nil, nil
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		c.log.Debug("Failed to fetch config", "url", url, "error", err)
-		return nil, nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		c.log.Debug("Config fetch returned non-200 status", "url", url, "status", resp.StatusCode)
-		return nil, nil
-	}
-	// Read one past the cap so an oversized body is detected and rejected rather
-	// than silently truncated (gzip ignores trailing bytes, so a truncated body
-	// with a valid prefix would otherwise parse). Matches ParseConfigFromReader.
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxConfigSize+1))
-	if err != nil {
-		c.log.Debug("Failed to read config response", "url", url, "error", err)
-		return nil, nil
-	}
-	if len(data) > maxConfigSize {
-		c.log.Debug("Config response exceeds size cap", "url", url, "cap", maxConfigSize)
-		return nil, nil
-	}
-	cfg, err := ParseConfig(data)
-	if err != nil {
-		c.log.Debug("Failed to parse config", "url", url, "error", err)
-		return nil, nil
-	}
-	return data, cfg
-}
-
 // loadPersistedConfig returns the config saved by a prior successful fetch, or
 // nil when none is configured/present or it can't be read or parsed. See
 // WithConfigCacheFile.
 func (c *Client) loadPersistedConfig() *Config {
+	_, cfg := c.readPersistedConfig()
+	return cfg
+}
+
+func (c *Client) readPersistedConfig() ([]byte, *Config) {
 	if c.configCachePath == "" {
-		return nil
+		return nil, nil
 	}
 	f, err := os.Open(c.configCachePath)
 	if err != nil {
-		// A missing cache is the normal first-run case; anything else (e.g. a
-		// permission problem) is worth surfacing before falling back to the seed.
 		if !os.IsNotExist(err) {
 			c.log.Warn("Failed to open persisted config, using seed", "path", c.configCachePath, "error", err)
 		}
-		return nil
+		return nil, nil
 	}
 	defer f.Close()
-	cfg, err := ParseConfigFromReader(f)
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigSize+1))
+	if err != nil {
+		c.log.Warn("Unable to read persisted config", "path", c.configCachePath, "error", err)
+		return nil, nil
+	}
+	if len(data) > maxConfigSize {
+		c.log.Warn("Persisted config exceeds size cap", "path", c.configCachePath, "cap", maxConfigSize)
+		return nil, nil
+	}
+	cfg, err := ParseConfig(data)
 	if err != nil {
 		c.log.Warn("Ignoring unparseable persisted config", "path", c.configCachePath, "error", err)
-		return nil
+		return nil, nil
 	}
 	c.log.Debug("Bootstrapped from persisted config", "path", c.configCachePath, "providers", len(cfg.Providers))
-	return cfg
+	return data, cfg
 }
 
 // persistConfig writes the freshly fetched config so the next start can boot
