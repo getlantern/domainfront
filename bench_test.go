@@ -3,6 +3,7 @@ package domainfront
 import (
 	"context"
 	"net/http"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -188,3 +189,15 @@ func TestGoroutineCount(t *testing.T) {
 		before, during, after, during-before, after-before)
 }
 
+func BenchmarkParsePublishedConfig(b *testing.B) {
+	data, err := os.ReadFile("fronted.yaml.gz")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := ParseConfig(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
