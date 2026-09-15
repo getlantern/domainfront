@@ -222,7 +222,7 @@ func TestConfigMetadataRequiresMatchingUsablePayload(t *testing.T) {
 	payload := gzConfig(t, "persisted")
 	invalid, err := CompressConfig([]byte("providers: {}\n"))
 	require.NoError(t, err)
-	for _, mode := range []string{"valid", "no-metadata", "bad-metadata", "wrong-hash", "changed-payload", "no-payload", "invalid-payload", "oversized-metadata"} {
+	for _, mode := range []string{"valid", "no-metadata", "bad-metadata", "wrong-hash", "changed-payload", "no-payload", "invalid-payload", "oversized-metadata", "bad-last-modified", "valid-last-modified"} {
 		t.Run(mode, func(t *testing.T) {
 			headers := make(chan http.Header, 1)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -248,7 +248,14 @@ func TestConfigMetadataRequiresMatchingUsablePayload(t *testing.T) {
 			if mode == "invalid-payload" {
 				hash = configDigest(data)
 			}
-			metadata, err := json.Marshal(configMetadata{SHA256: hash, Validators: map[string]configValidator{server.URL: {ETag: `"persisted"`}}})
+			validator := configValidator{ETag: `"persisted"`}
+			if mode == "bad-last-modified" {
+				validator = configValidator{LastModified: "not an HTTP date"}
+			}
+			if mode == "valid-last-modified" {
+				validator = configValidator{LastModified: "Mon, 14 Sep 2026 00:00:00 GMT"}
+			}
+			metadata, err := json.Marshal(configMetadata{SHA256: hash, Validators: map[string]configValidator{server.URL: validator}})
 			require.NoError(t, err)
 			if mode == "bad-metadata" {
 				metadata = []byte("invalid json")
@@ -267,6 +274,11 @@ func TestConfigMetadataRequiresMatchingUsablePayload(t *testing.T) {
 				assert.Equal(t, `"persisted"`, h.Get("If-None-Match"))
 			} else {
 				assert.Empty(t, h.Get("If-None-Match"))
+			}
+			if mode == "valid-last-modified" {
+				assert.Equal(t, "Mon, 14 Sep 2026 00:00:00 GMT", h.Get("If-Modified-Since"))
+			} else {
+				assert.Empty(t, h.Get("If-Modified-Since"))
 			}
 			if mode == "no-payload" || mode == "invalid-payload" {
 				assert.True(t, hasProvider(c, "seed"))
@@ -395,5 +407,54 @@ func BenchmarkConfigRefresh(b *testing.B) {
 				c.fetchAndApplyConfig()
 			}
 		})
+	}
+}
+
+func TestConfigMetadataRejectsPartialValidatorRestore(t *testing.T) {
+	payload := gzConfig(t, "persisted")
+	headers := make(chan http.Header, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Clone()
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "fronted.yaml.gz")
+	require.NoError(t, os.WriteFile(path, payload, 0600))
+	metadata, err := json.Marshal(configMetadata{
+		SHA256: configDigest(payload),
+		Validators: map[string]configValidator{
+			server.URL + "/good": {ETag: `"good"`, LastModified: "Mon, 14 Sep 2026 00:00:00 GMT"},
+			server.URL + "/bad":  {ETag: `"bad"`, LastModified: "corrupt date"},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path+".http.json", metadata, 0600))
+	c, err := New(context.Background(), seedConfig("seed"), WithConfigCacheFile(path), WithConfigURL(server.URL+"/good", server.URL+"/bad"), WithDialer(noDialer{}))
+	require.NoError(t, err)
+	defer c.Close()
+	for range 2 {
+		h := receiveConfigHeader(t, headers)
+		assert.Empty(t, h.Get("If-None-Match"))
+		assert.Empty(t, h.Get("If-Modified-Since"))
+	}
+}
+
+func TestReceiveConfigResponseDrainsQueueAfterDeadline(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+	for range 100 {
+		results := make(chan *configResponse, 2)
+		results <- nil
+		expected := &configResponse{url: "https://example.com/config", data: []byte("completed response")}
+		results <- expected
+		failed, ok := receiveConfigResponse(ctx, results)
+		require.True(t, ok)
+		require.Nil(t, failed)
+		got, ok := receiveConfigResponse(ctx, results)
+		require.True(t, ok, "a ready deadline must not discard queued responses")
+		require.Same(t, expected, got)
+		_, ok = receiveConfigResponse(ctx, results)
+		require.False(t, ok, "stop waiting once the deadline has passed and the queue is empty")
 	}
 }

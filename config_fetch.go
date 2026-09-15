@@ -56,10 +56,11 @@ func (c *Client) fetchAndApplyConfig() {
 		}
 	}()
 	for range c.configURLs {
-		var r *configResponse
-		select {
-		case r = <-results:
-		case <-ctx.Done():
+		if c.ctx.Err() != nil {
+			return
+		}
+		r, ok := receiveConfigResponse(ctx, results)
+		if !ok {
 			if !unchanged {
 				c.log.Debug("Config refresh ended before a usable response", "error", ctx.Err())
 			}
@@ -107,6 +108,22 @@ func (c *Client) fetchAndApplyConfig() {
 		c.log.Debug("Config unchanged")
 	} else {
 		c.log.Warn("No source produced a usable config", "urls", c.configURLs)
+	}
+}
+
+// receiveConfigResponse stops waiting at the fetch deadline but preserves
+// responses queued while the collector was parsing or waiting for resume.
+func receiveConfigResponse(ctx context.Context, results <-chan *configResponse) (*configResponse, bool) {
+	select {
+	case r := <-results:
+		return r, true
+	case <-ctx.Done():
+		select {
+		case r := <-results:
+			return r, true
+		default:
+			return nil, false
+		}
 	}
 }
 
@@ -191,6 +208,15 @@ func (c *Client) loadConfigValidators() {
 	var metadata configMetadata
 	if json.Unmarshal(data, &metadata) != nil || metadata.SHA256 != c.configHash {
 		return
+	}
+	// Validate the complete configured set before changing state, so a corrupt
+	// timestamp cannot leave a partially restored set of conditional headers.
+	for _, url := range c.configURLs {
+		if modified := metadata.Validators[url].LastModified; modified != "" {
+			if _, err := http.ParseTime(modified); err != nil {
+				return
+			}
+		}
 	}
 	for _, url := range c.configURLs {
 		c.rememberConfigValidator(url, metadata.Validators[url])
