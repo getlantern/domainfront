@@ -1,6 +1,7 @@
 package domainfront
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,4 +36,20 @@ func TestGenerateSNI(t *testing.T) {
 		// We can't guarantee they differ, but we can check it's from the list
 		assert.Contains(t, cfg.ArbitrarySNIs, sni3)
 	})
+}
+
+func TestGenerateSNIPrefixEquivalent(t *testing.T) {
+	original := &SNIConfig{UseArbitrarySNIs: true, ArbitrarySNIs: make([]string, 1000)}
+	for i := range original.ArbitrarySNIs {
+		original.ArbitrarySNIs[i] = fmt.Sprintf("sni-%d.example", i)
+	}
+	compact := &SNIConfig{UseArbitrarySNIs: true, ArbitrarySNIs: original.ArbitrarySNIs[:256]}
+	seen := make(map[string]bool)
+	for i := 0; i < 10000; i++ {
+		ip := fmt.Sprintf("10.0.%d.%d", i/256, i%256)
+		before := GenerateSNI(original, ip)
+		assert.Equal(t, before, GenerateSNI(compact, ip), ip)
+		seen[before] = true
+	}
+	assert.Len(t, seen, 256, "exercise every reachable SNI through the real selector")
 }
