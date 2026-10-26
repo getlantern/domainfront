@@ -347,3 +347,22 @@ func TestNewConnectedRoundTripper_OverlappingFallbacksQueueOnce(t *testing.T) {
 	}
 	assert.Equal(t, 1, c.pool.readyCount())
 }
+
+// A closed client mustn't open connections. Lanes that fall back to unvetted
+// fronts skip Take, which is where the pool reports it's closed.
+func TestNewConnectedRoundTripper_ClosedPoolDialsNothing(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	addr, cleanup := mockCDN(t, newTestLeafCert(t, caCert, caKey, "cdn.example.com"))
+	defer cleanup()
+
+	c := newRaceClient(t, caCert, map[string]*Provider{
+		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}, TestURL: pingURL},
+	})
+	f := cdnFront("mapped", addr)
+	c.pool.Replace([]*front{f})
+	c.pool.Close()
+
+	_, err := c.NewConnectedRoundTripper(context.Background(), "origin.example.com:443")
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, f.isSucceeding(), "the front was never vetted")
+}

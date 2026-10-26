@@ -102,6 +102,10 @@ func (c *Client) connectVia(ctx context.Context, pid, host string) laneResult {
 	// already dialed rather than spend the budget on them twice.
 	tried := make(map[*front]struct{})
 	for range c.maxRetries {
+		if c.pool.isClosed() {
+			// The client is shut down. Take reports this as context.Canceled.
+			return laneResult{err: fmt.Errorf("provider %s: %w", pid, context.Canceled)}
+		}
 		f, ready := c.pool.tryTakeFrom(func(f *front) bool {
 			_, seen := tried[f]
 			return !seen && c.providerIDOf(f) == pid

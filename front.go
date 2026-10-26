@@ -248,6 +248,16 @@ func (p *frontPool) ReturnSuccess(f *front) {
 	p.addReady(f)
 }
 
+// isClosed reports whether Close has been called.
+func (p *frontPool) isClosed() bool {
+	select {
+	case <-p.closed:
+		return true
+	default:
+		return false
+	}
+}
+
 // Close shuts down the pool, unblocking any pending Take calls.
 func (p *frontPool) Close() {
 	select {
