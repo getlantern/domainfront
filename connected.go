@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"sync/atomic"
+	"time"
 )
 
 // NewConnectedRoundTripper returns an http.RoundTripper whose underlying TLS
@@ -77,8 +78,9 @@ type laneResult struct {
 
 // connectVia dials pid's fronts one at a time until one connects, up to
 // maxRetries of them. It prefers fronts the crawler has vetted (the ready
-// queue). When none of pid's are ready it dials pid's other fronts directly,
-// most recently successful first, rather than waiting for the crawler: the
+// queue). When none of pid's are ready it vets and dials pid's other fronts
+// itself (see dialUnvetted), most recently successful first, rather than
+// waiting for the crawler: the
 // crawler fills the ready queue for all providers together, so it can stop
 // with every ready front belonging to providers that can't serve this host.
 func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
@@ -122,7 +124,12 @@ func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
 			lastErr = fmt.Errorf("no provider for front %s/%s", f.ProviderID, f.Domain)
 			continue
 		}
-		result := dialFront(ctx, f, c.certPool(), c.clientHelloID, c.dialer)
+		var result dialResult
+		if ready {
+			result = dialFront(ctx, f, c.certPool(), c.clientHelloID, c.dialer)
+		} else {
+			result = c.dialUnvetted(ctx, f, provider)
+		}
 		if result.err != nil {
 			if ctx.Err() != nil {
 				// Cancelled (another provider won, or the caller gave up):
@@ -152,6 +159,35 @@ func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
 		return laneResult{err: fmt.Errorf("provider %s: no fronts", pid)}
 	}
 	return laneResult{err: fmt.Errorf("provider %s: %w", pid, lastErr)}
+}
+
+// dialUnvetted dials f, a front the crawler hasn't vetted (or has rejected),
+// for connectVia. A front can complete TLS yet refuse to forward, and a front
+// that wins the race carries the request with no retry, so f must first pass
+// the crawler's check: a POST to the provider's test URL. That spends the
+// connection, so f is dialed again for the caller.
+func (c *Client) dialUnvetted(ctx context.Context, f *front, provider *Provider) dialResult {
+	if provider.TestURL == "" {
+		return dialResult{err: fmt.Errorf("provider %s has no test URL to vet front %s", c.providerIDOf(f), f.Domain)}
+	}
+	result := dialFront(ctx, f, c.certPool(), c.clientHelloID, c.dialer)
+	if result.err != nil {
+		return result
+	}
+	// verifyWithPost doesn't take a ctx, so bound it with the conn instead.
+	stop := context.AfterFunc(ctx, func() { result.conn.Close() })
+	result.conn.SetDeadline(time.Now().Add(dialTimeout))
+	ok := c.verifyWithPost(result.conn, provider.TestURL)
+	stop()
+	result.conn.Close()
+	if err := ctx.Err(); err != nil {
+		return dialResult{err: err}
+	}
+	if !ok {
+		return dialResult{err: fmt.Errorf("front %s failed vetting", f.Domain)}
+	}
+	f.markSucceeded()
+	return dialFront(ctx, f, c.certPool(), c.clientHelloID, c.dialer)
 }
 
 // providersMapping returns, sorted, the IDs of the providers with a mapping

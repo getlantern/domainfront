@@ -2,8 +2,10 @@ package domainfront
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"crypto/x509"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"testing"
@@ -22,6 +24,7 @@ func newRaceClient(t *testing.T, caCert *x509.Certificate, providers map[string]
 	c := &Client{
 		ctx:           ctx,
 		cancel:        cancel,
+		log:           slog.Default(),
 		pool:          newFrontPool(16),
 		maxRetries:    2,
 		cacheDirty:    make(chan struct{}, 1),
@@ -39,6 +42,9 @@ func newRaceClient(t *testing.T, caCert *x509.Certificate, providers map[string]
 func cdnFront(provider, addr string) *front {
 	return newFront(&Masquerade{Domain: "cdn.example.com", IpAddress: addr}, provider)
 }
+
+// pingURL is mockCDN's vetting endpoint, which answers a POST with 202.
+const pingURL = "https://cdn.example.com/ping"
 
 func closedAddr(t *testing.T) string {
 	t.Helper()
@@ -133,7 +139,7 @@ func TestNewConnectedRoundTripper_DialsUnvettedFrontsWhenNoneReady(t *testing.T)
 
 	c := newRaceClient(t, caCert, map[string]*Provider{
 		"nomap":  {HostAliases: map[string]string{"other.example.com": "cdn.example.com"}},
-		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}},
+		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}, TestURL: pingURL},
 	})
 	unvetted := cdnFront("mapped", addr)
 	c.pool.Replace([]*front{unvetted, cdnFront("nomap", addr), cdnFront("nomap", addr)})
@@ -160,7 +166,7 @@ func TestNewConnectedRoundTripper_DoesNotRedialAFailedFront(t *testing.T) {
 
 	for range 20 {
 		c := newRaceClient(t, caCert, map[string]*Provider{
-			"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}},
+			"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}, TestURL: pingURL},
 		})
 		dead, live := cdnFront("mapped", closedAddr(t)), cdnFront("mapped", addr)
 		c.pool.Replace([]*front{dead, live})
@@ -173,4 +179,54 @@ func TestNewConnectedRoundTripper_DoesNotRedialAFailedFront(t *testing.T) {
 		require.Same(t, live, rt.(*connectedRoundTripper).front)
 		require.NoError(t, rt.(*connectedRoundTripper).Close())
 	}
+}
+
+// A front can complete TLS yet refuse to forward, which is what the crawler's
+// vetting catches. A front the lane dials without the crawler must pass the
+// same check before it can win, since the request it carries has no retry.
+func TestNewConnectedRoundTripper_VetsUnvettedFronts(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	addr, cleanup := mockCDN(t, newTestLeafCert(t, caCert, caKey, "cdn.example.com"))
+	defer cleanup()
+
+	c := newRaceClient(t, caCert, map[string]*Provider{
+		// mockCDN answers this POST with 200, not the 202 vetting expects.
+		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}, TestURL: "https://cdn.example.com/refused"},
+	})
+	rejected := cdnFront("mapped", addr)
+	rejected.markSucceeded()
+	c.pool.Replace([]*front{rejected})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := c.NewConnectedRoundTripper(ctx, "origin.example.com:443")
+	require.ErrorContains(t, err, "failed vetting")
+	assert.False(t, rejected.isSucceeding())
+}
+
+// Vetting sends a request the caller can't cancel directly, so cancelling
+// the race must still stop a lane stuck waiting on the vetting response.
+func TestNewConnectedRoundTripper_CancelStopsVetting(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	hung := make(chan struct{})
+	defer close(hung)
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", &stdtls.Config{
+		Certificates: []stdtls.Certificate{newTestLeafCert(t, caCert, caKey, "cdn.example.com")},
+	})
+	require.NoError(t, err)
+	srv := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-hung })}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	c := newRaceClient(t, caCert, map[string]*Provider{
+		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}, TestURL: pingURL},
+	})
+	c.pool.Replace([]*front{cdnFront("mapped", ln.Addr().String())})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = c.NewConnectedRoundTripper(ctx, "origin.example.com:443")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 2*time.Second)
 }
