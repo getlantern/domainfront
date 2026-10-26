@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,9 @@ type front struct {
 	LastSucceeded time.Time `json:"LastSucceeded"`
 	ProviderID    string    `json:"ProviderID"`
 	mu            sync.RWMutex
+	// queued is whether f is in the pool's ready queue, so a front returned
+	// by more than one user (or vetted while in use) is queued only once.
+	queued atomic.Bool
 }
 
 func newFront(m *Masquerade, providerID string) *front {
@@ -67,6 +71,9 @@ func (f *front) key() frontKey {
 type frontPool struct {
 	mu     sync.Mutex
 	fronts []*front
+	// scanMu serializes scans of the ready queue: a scan holds the fronts it
+	// skips until it puts them back, and a concurrent scan would miss them.
+	scanMu sync.Mutex
 	ready  chan *front
 	closed chan struct{}
 }
@@ -102,7 +109,8 @@ func (p *frontPool) Replace(fronts []*front) {
 	// Drain the ready channel; the crawler will repopulate it
 	for {
 		select {
-		case <-p.ready:
+		case f := <-p.ready:
+			f.queued.Store(false)
 		default:
 			return
 		}
@@ -111,10 +119,14 @@ func (p *frontPool) Replace(fronts []*front) {
 
 // addReady marks a front as ready (working) and makes it available for Take.
 func (p *frontPool) addReady(f *front) {
+	if !f.queued.CompareAndSwap(false, true) {
+		return
+	}
 	select {
 	case p.ready <- f:
 	default:
 		// ready channel full, drop
+		f.queued.Store(false)
 	}
 }
 
@@ -127,6 +139,7 @@ func (p *frontPool) readyCount() int {
 func (p *frontPool) Take(ctx context.Context) (*front, error) {
 	select {
 	case f := <-p.ready:
+		f.queued.Store(false)
 		return f, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -156,6 +169,8 @@ func (p *frontPool) TakePreferringUntried(ctx context.Context, tried map[string]
 		return first, nil
 	}
 
+	p.scanMu.Lock()
+	defer p.scanMu.Unlock()
 	skipped := []*front{first}
 	selected := first
 	scan := min(p.readyCount(), maxProviderScan)
@@ -178,11 +193,36 @@ func (p *frontPool) TakePreferringUntried(ctx context.Context, tried map[string]
 	return selected, nil
 }
 
+// tryTakeFrom returns a ready front that match accepts, without blocking, or
+// ok=false when none is ready. The ready queue mixes every provider's fronts,
+// so it pulls fronts until one matches and puts the rest back.
+func (p *frontPool) tryTakeFrom(match func(*front) bool) (f *front, ok bool) {
+	p.scanMu.Lock()
+	defer p.scanMu.Unlock()
+	var skipped []*front
+	for range p.readyCount() {
+		r, more := p.tryTakeReady()
+		if !more {
+			break
+		}
+		if match(r) {
+			f, ok = r, true
+			break
+		}
+		skipped = append(skipped, r)
+	}
+	for _, s := range skipped {
+		p.addReady(s)
+	}
+	return f, ok
+}
+
 // tryTakeReady returns a ready front without blocking, or ok=false when none is
 // immediately available.
 func (p *frontPool) tryTakeReady() (*front, bool) {
 	select {
 	case f := <-p.ready:
+		f.queued.Store(false)
 		return f, true
 	default:
 		return nil, false
@@ -206,6 +246,16 @@ func (p *frontPool) Return(f *front, requeue bool) {
 func (p *frontPool) ReturnSuccess(f *front) {
 	f.markSucceeded()
 	p.addReady(f)
+}
+
+// isClosed reports whether Close has been called.
+func (p *frontPool) isClosed() bool {
+	select {
+	case <-p.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 // Close shuts down the pool, unblocking any pending Take calls.
