@@ -41,26 +41,37 @@ func (c *Client) NewConnectedRoundTripper(ctx context.Context, addr string) (htt
 	raceCtx, cancel := context.WithCancel(ctx)
 	results := make(chan laneResult, len(pids))
 	for _, pid := range pids {
-		go func() { results <- c.connectVia(raceCtx, pid) }()
+		go func() { results <- c.connectVia(raceCtx, pid, host) }()
 	}
-
-	var errs []error
-	for remaining := len(pids); remaining > 0; remaining-- {
-		r := <-results
-		if r.err != nil {
-			errs = append(errs, r.err)
-			continue
-		}
-		cancel()
-		// The other providers stop once cancelled, but a front already
-		// mid-handshake can still connect: release it.
-		go func(n int) {
+	// release closes the fronts that connect after the race is decided: the
+	// lanes stop once cancelled, but a front mid-handshake can still connect.
+	release := func(n int) {
+		go func() {
 			for range n {
 				if r := <-results; r.rt != nil {
 					r.rt.Close()
 				}
 			}
-		}(remaining - 1)
+		}()
+	}
+
+	var errs []error
+	for remaining := len(pids); remaining > 0; remaining-- {
+		var r laneResult
+		select {
+		case r = <-results:
+		case <-ctx.Done():
+			// The TLS handshake doesn't watch ctx, so don't wait it out.
+			cancel()
+			release(remaining)
+			return nil, fmt.Errorf("ctx done before any front connected: %w", errors.Join(append(errs, ctx.Err())...))
+		}
+		if r.err != nil {
+			errs = append(errs, r.err)
+			continue
+		}
+		cancel()
+		release(remaining - 1)
 		return r.rt, nil
 	}
 	cancel()
@@ -83,7 +94,7 @@ type laneResult struct {
 // waiting for the crawler: the
 // crawler fills the ready queue for all providers together, so it can stop
 // with every ready front belonging to providers that can't serve this host.
-func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
+func (c *Client) connectVia(ctx context.Context, pid, host string) laneResult {
 	var lastErr error
 	var candidates []*front
 	loaded := false
@@ -123,6 +134,13 @@ func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
 			}
 			lastErr = fmt.Errorf("no provider for front %s/%s", f.ProviderID, f.Domain)
 			continue
+		}
+		if host != "" && provider.Lookup(host) == "" {
+			// A config update dropped the mapping since the race began.
+			if ready {
+				c.pool.Return(f, true)
+			}
+			return laneResult{err: fmt.Errorf("provider %s: no longer maps '%s'", pid, host)}
 		}
 		var result dialResult
 		if ready {

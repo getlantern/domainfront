@@ -230,3 +230,52 @@ func TestNewConnectedRoundTripper_CancelStopsVetting(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(start), 2*time.Second)
 }
+
+// The TLS handshake runs on a fixed deadline rather than ctx, so the caller
+// must not wait for a lane stuck in one once ctx ends.
+func TestNewConnectedRoundTripper_CancelDoesNotWaitForHandshake(t *testing.T) {
+	caCert, _ := newTestCA(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Accept, then never answer the ClientHello.
+			t.Cleanup(func() { conn.Close() })
+		}
+	}()
+
+	c := newRaceClient(t, caCert, map[string]*Provider{
+		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}},
+	})
+	c.pool.addReady(cdnFront("mapped", ln.Addr().String()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = c.NewConnectedRoundTripper(ctx, "origin.example.com:443")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 2*time.Second)
+}
+
+// A config update can drop a provider's mapping after the race picks it. The
+// lane must stop rather than connect a front that can't carry the request.
+func TestConnectVia_StopsWhenTheMappingIsGone(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	addr, cleanup := mockCDN(t, newTestLeafCert(t, caCert, caKey, "cdn.example.com"))
+	defer cleanup()
+
+	c := newRaceClient(t, caCert, map[string]*Provider{
+		"mapped": {HostAliases: map[string]string{"other.example.com": "cdn.example.com"}},
+	})
+	c.pool.addReady(cdnFront("mapped", addr))
+
+	r := c.connectVia(context.Background(), "mapped", "origin.example.com")
+	require.ErrorContains(t, r.err, "no longer maps")
+	assert.Nil(t, r.rt)
+	assert.Equal(t, 1, c.pool.readyCount(), "the front goes back to the pool")
+}
