@@ -279,3 +279,22 @@ func TestConnectVia_StopsWhenTheMappingIsGone(t *testing.T) {
 	assert.Nil(t, r.rt)
 	assert.Equal(t, 1, c.pool.readyCount(), "the front goes back to the pool")
 }
+
+// Without a test URL a fallback front can't be vetted, which is no fault of
+// the front: it must not be marked failed.
+func TestNewConnectedRoundTripper_NoTestURLLeavesFrontsAlone(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	addr, cleanup := mockCDN(t, newTestLeafCert(t, caCert, caKey, "cdn.example.com"))
+	defer cleanup()
+
+	c := newRaceClient(t, caCert, map[string]*Provider{
+		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}},
+	})
+	f := cdnFront("mapped", addr)
+	f.markSucceeded()
+	c.pool.Replace([]*front{f})
+
+	_, err := c.NewConnectedRoundTripper(context.Background(), "origin.example.com:443")
+	require.ErrorContains(t, err, "no test URL")
+	assert.True(t, f.isSucceeding())
+}

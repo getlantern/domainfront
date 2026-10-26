@@ -142,6 +142,11 @@ func (c *Client) connectVia(ctx context.Context, pid, host string) laneResult {
 			}
 			return laneResult{err: fmt.Errorf("provider %s: no longer maps '%s'", pid, host)}
 		}
+		if !ready && provider.TestURL == "" {
+			// Without a test URL no fallback front can be vetted, and that
+			// says nothing about the fronts.
+			return laneResult{err: fmt.Errorf("provider %s: no ready fronts and no test URL to vet others", pid)}
+		}
 		var result dialResult
 		if ready {
 			result = dialFront(ctx, f, c.certPool(), c.clientHelloID, c.dialer)
@@ -185,9 +190,6 @@ func (c *Client) connectVia(ctx context.Context, pid, host string) laneResult {
 // the crawler's check: a POST to the provider's test URL. That spends the
 // connection, so f is dialed again for the caller.
 func (c *Client) dialUnvetted(ctx context.Context, f *front, provider *Provider) dialResult {
-	if provider.TestURL == "" {
-		return dialResult{err: fmt.Errorf("provider %s has no test URL to vet front %s", c.providerIDOf(f), f.Domain)}
-	}
 	result := dialFront(ctx, f, c.certPool(), c.clientHelloID, c.dialer)
 	if result.err != nil {
 		return result
