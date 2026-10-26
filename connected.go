@@ -17,8 +17,8 @@ import (
 // wrapper.
 //
 // It races every provider that has a mapping for addr's host, dialing one of
-// each provider's fronts at a time (up to maxRetries per provider), and the
-// first front to connect wins. Providers without a mapping are skipped: a
+// each provider's fronts at a time (up to maxRetries per provider; see
+// connectVia), and the first front to connect wins. Providers without a mapping are skipped: a
 // front of theirs could connect but never carry the request. If no provider
 // maps the host, it fails at once. An addr without a host races every
 // provider.
@@ -75,21 +75,37 @@ type laneResult struct {
 	err error
 }
 
-// connectVia dials pid's ready fronts one at a time until one connects, up to
-// maxRetries of them.
+// connectVia dials pid's fronts one at a time until one connects, up to
+// maxRetries of them. It prefers fronts the crawler has vetted (the ready
+// queue). When none of pid's are ready it dials pid's other fronts directly,
+// most recently successful first, rather than waiting for the crawler: the
+// crawler fills the ready queue for all providers together, so it can stop
+// with every ready front belonging to providers that can't serve this host.
 func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
 	var lastErr error
+	var candidates []*front
+	loaded := false
 	for range c.maxRetries {
-		f, err := c.pool.takeFrom(ctx, func(f *front) bool { return c.providerIDOf(f) == pid })
-		if err != nil {
-			if lastErr != nil {
-				err = fmt.Errorf("%w (last dial error: %w)", err, lastErr)
+		f, ready := c.pool.tryTakeFrom(func(f *front) bool { return c.providerIDOf(f) == pid })
+		if !ready {
+			if !loaded {
+				for _, cf := range c.pool.candidates() {
+					if c.providerIDOf(cf) == pid {
+						candidates = append(candidates, cf)
+					}
+				}
+				loaded = true
 			}
-			return laneResult{err: fmt.Errorf("provider %s: take front: %w", pid, err)}
+			if len(candidates) == 0 {
+				break
+			}
+			f, candidates = candidates[0], candidates[1:]
 		}
 		provider := c.providerFor(f)
 		if provider == nil {
-			c.pool.Return(f, true)
+			if ready {
+				c.pool.Return(f, true)
+			}
 			lastErr = fmt.Errorf("no provider for front %s/%s", f.ProviderID, f.Domain)
 			continue
 		}
@@ -98,10 +114,17 @@ func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
 			if ctx.Err() != nil {
 				// Cancelled (another provider won, or the caller gave up):
 				// that says nothing about this front.
-				c.pool.Return(f, true)
+				if ready {
+					c.pool.Return(f, true)
+				}
 				return laneResult{err: fmt.Errorf("provider %s: %w", pid, ctx.Err())}
 			}
-			c.returnAfterDialFailure(f)
+			if ready {
+				c.returnAfterDialFailure(f)
+			} else if !c.gate.isPaused() {
+				f.markFailed()
+				c.notifyCacheDirty()
+			}
 			lastErr = fmt.Errorf("dial front %s: %w", f.Domain, result.err)
 			continue
 		}
@@ -113,9 +136,9 @@ func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
 		}}
 	}
 	if lastErr == nil {
-		lastErr = errors.New("no attempts")
+		return laneResult{err: fmt.Errorf("provider %s: no fronts", pid)}
 	}
-	return laneResult{err: fmt.Errorf("provider %s: after %d attempts: %w", pid, c.maxRetries, lastErr)}
+	return laneResult{err: fmt.Errorf("provider %s: %w", pid, lastErr)}
 }
 
 // providersMapping returns, sorted, the IDs of the providers with a mapping

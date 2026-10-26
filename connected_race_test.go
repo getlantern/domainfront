@@ -122,3 +122,31 @@ func TestNewConnectedRoundTripper_RacesEveryMappedProvider(t *testing.T) {
 	assert.Equal(t, "live", rt.(*connectedRoundTripper).front.ProviderID)
 	require.NoError(t, rt.(*connectedRoundTripper).Close())
 }
+
+// The crawler stops once enough fronts are ready in total, so every ready
+// front can belong to providers that can't serve the host. A provider with
+// none ready must still be tried, through the fronts the crawler hasn't vetted.
+func TestNewConnectedRoundTripper_DialsUnvettedFrontsWhenNoneReady(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	addr, cleanup := mockCDN(t, newTestLeafCert(t, caCert, caKey, "cdn.example.com"))
+	defer cleanup()
+
+	c := newRaceClient(t, caCert, map[string]*Provider{
+		"nomap":  {HostAliases: map[string]string{"other.example.com": "cdn.example.com"}},
+		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}},
+	})
+	unvetted := cdnFront("mapped", addr)
+	c.pool.Replace([]*front{unvetted, cdnFront("nomap", addr), cdnFront("nomap", addr)})
+	c.pool.addReady(cdnFront("nomap", addr))
+	c.pool.addReady(cdnFront("nomap", addr))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	rt, err := c.NewConnectedRoundTripper(ctx, "origin.example.com:443")
+	require.NoError(t, err)
+	assert.Same(t, unvetted, rt.(*connectedRoundTripper).front)
+	assert.Less(t, time.Since(start), 5*time.Second)
+	assert.Equal(t, 2, c.pool.readyCount(), "the other provider's ready fronts stay ready")
+	require.NoError(t, rt.(*connectedRoundTripper).Close())
+}
