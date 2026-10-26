@@ -150,3 +150,27 @@ func TestNewConnectedRoundTripper_DialsUnvettedFrontsWhenNoneReady(t *testing.T)
 	assert.Equal(t, 2, c.pool.readyCount(), "the other provider's ready fronts stay ready")
 	require.NoError(t, rt.(*connectedRoundTripper).Close())
 }
+
+// A ready front that fails to dial is still among the provider's fronts, so
+// falling back to them must not dial it again and spend the last attempt.
+func TestNewConnectedRoundTripper_DoesNotRedialAFailedFront(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	addr, cleanup := mockCDN(t, newTestLeafCert(t, caCert, caKey, "cdn.example.com"))
+	defer cleanup()
+
+	for range 20 {
+		c := newRaceClient(t, caCert, map[string]*Provider{
+			"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}},
+		})
+		dead, live := cdnFront("mapped", closedAddr(t)), cdnFront("mapped", addr)
+		c.pool.Replace([]*front{dead, live})
+		c.pool.addReady(dead)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		rt, err := c.NewConnectedRoundTripper(ctx, "origin.example.com:443")
+		cancel()
+		require.NoError(t, err)
+		require.Same(t, live, rt.(*connectedRoundTripper).front)
+		require.NoError(t, rt.(*connectedRoundTripper).Close())
+	}
+}

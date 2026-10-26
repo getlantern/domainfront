@@ -85,8 +85,14 @@ func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
 	var lastErr error
 	var candidates []*front
 	loaded := false
+	// A front that failed is still among the candidates, so skip the ones
+	// already dialed rather than spend the budget on them twice.
+	tried := make(map[*front]struct{})
 	for range c.maxRetries {
-		f, ready := c.pool.tryTakeFrom(func(f *front) bool { return c.providerIDOf(f) == pid })
+		f, ready := c.pool.tryTakeFrom(func(f *front) bool {
+			_, seen := tried[f]
+			return !seen && c.providerIDOf(f) == pid
+		})
 		if !ready {
 			if !loaded {
 				for _, cf := range c.pool.candidates() {
@@ -96,11 +102,18 @@ func (c *Client) connectVia(ctx context.Context, pid string) laneResult {
 				}
 				loaded = true
 			}
+			for len(candidates) > 0 {
+				if _, seen := tried[candidates[0]]; !seen {
+					break
+				}
+				candidates = candidates[1:]
+			}
 			if len(candidates) == 0 {
 				break
 			}
 			f, candidates = candidates[0], candidates[1:]
 		}
+		tried[f] = struct{}{}
 		provider := c.providerFor(f)
 		if provider == nil {
 			if ready {
