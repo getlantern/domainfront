@@ -67,6 +67,9 @@ func (f *front) key() frontKey {
 type frontPool struct {
 	mu     sync.Mutex
 	fronts []*front
+	// scanMu serializes scans of the ready queue: a scan holds the fronts it
+	// skips until it puts them back, and a concurrent scan would miss them.
+	scanMu sync.Mutex
 	ready  chan *front
 	closed chan struct{}
 }
@@ -156,6 +159,8 @@ func (p *frontPool) TakePreferringUntried(ctx context.Context, tried map[string]
 		return first, nil
 	}
 
+	p.scanMu.Lock()
+	defer p.scanMu.Unlock()
 	skipped := []*front{first}
 	selected := first
 	scan := min(p.readyCount(), maxProviderScan)
@@ -182,6 +187,8 @@ func (p *frontPool) TakePreferringUntried(ctx context.Context, tried map[string]
 // ok=false when none is ready. The ready queue mixes every provider's fronts,
 // so it pulls fronts until one matches and puts the rest back.
 func (p *frontPool) tryTakeFrom(match func(*front) bool) (f *front, ok bool) {
+	p.scanMu.Lock()
+	defer p.scanMu.Unlock()
 	var skipped []*front
 	for range p.readyCount() {
 		r, more := p.tryTakeReady()
