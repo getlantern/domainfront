@@ -178,6 +178,45 @@ func (p *frontPool) TakePreferringUntried(ctx context.Context, tried map[string]
 	return selected, nil
 }
 
+// readyPollInterval is how often takeFrom looks again for a matching front
+// when none is ready.
+const readyPollInterval = 50 * time.Millisecond
+
+// takeFrom returns a ready front that match accepts, blocking until one is
+// available or ctx is cancelled. The ready queue mixes every provider's
+// fronts, so it pulls fronts until one matches and puts the rest back. When
+// none matches it looks again every readyPollInterval.
+func (p *frontPool) takeFrom(ctx context.Context, match func(*front) bool) (*front, error) {
+	for {
+		var skipped []*front
+		var found *front
+		for range p.readyCount() {
+			f, ok := p.tryTakeReady()
+			if !ok {
+				break
+			}
+			if match(f) {
+				found = f
+				break
+			}
+			skipped = append(skipped, f)
+		}
+		for _, f := range skipped {
+			p.addReady(f)
+		}
+		if found != nil {
+			return found, nil
+		}
+		select {
+		case <-time.After(readyPollInterval):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-p.closed:
+			return nil, context.Canceled
+		}
+	}
+}
+
 // tryTakeReady returns a ready front without blocking, or ok=false when none is
 // immediately available.
 func (p *frontPool) tryTakeReady() (*front, bool) {
