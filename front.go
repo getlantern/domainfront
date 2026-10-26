@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,9 @@ type front struct {
 	LastSucceeded time.Time `json:"LastSucceeded"`
 	ProviderID    string    `json:"ProviderID"`
 	mu            sync.RWMutex
+	// queued is whether f is in the pool's ready queue, so a front returned
+	// by more than one user (or vetted while in use) is queued only once.
+	queued atomic.Bool
 }
 
 func newFront(m *Masquerade, providerID string) *front {
@@ -105,7 +109,8 @@ func (p *frontPool) Replace(fronts []*front) {
 	// Drain the ready channel; the crawler will repopulate it
 	for {
 		select {
-		case <-p.ready:
+		case f := <-p.ready:
+			f.queued.Store(false)
 		default:
 			return
 		}
@@ -114,10 +119,14 @@ func (p *frontPool) Replace(fronts []*front) {
 
 // addReady marks a front as ready (working) and makes it available for Take.
 func (p *frontPool) addReady(f *front) {
+	if !f.queued.CompareAndSwap(false, true) {
+		return
+	}
 	select {
 	case p.ready <- f:
 	default:
 		// ready channel full, drop
+		f.queued.Store(false)
 	}
 }
 
@@ -130,6 +139,7 @@ func (p *frontPool) readyCount() int {
 func (p *frontPool) Take(ctx context.Context) (*front, error) {
 	select {
 	case f := <-p.ready:
+		f.queued.Store(false)
 		return f, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -212,6 +222,7 @@ func (p *frontPool) tryTakeFrom(match func(*front) bool) (f *front, ok bool) {
 func (p *frontPool) tryTakeReady() (*front, bool) {
 	select {
 	case f := <-p.ready:
+		f.queued.Store(false)
 		return f, true
 	default:
 		return nil, false

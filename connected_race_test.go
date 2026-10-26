@@ -298,3 +298,52 @@ func TestNewConnectedRoundTripper_NoTestURLLeavesFrontsAlone(t *testing.T) {
 	require.ErrorContains(t, err, "no test URL")
 	assert.True(t, f.isSucceeding())
 }
+
+// A front can be returned by more than one user, for instance two lanes that
+// both fell back to it, or vetted by the crawler while in use. It must still
+// take one place in the ready queue, or readyCount overstates the fronts
+// ready and the crawler stops replenishing early.
+func TestFrontPool_QueuesAFrontOnce(t *testing.T) {
+	p := newFrontPool(8)
+	f := cdnFront("mapped", "127.0.0.1:1")
+	p.addReady(f)
+	p.Return(f, true)
+	p.ReturnSuccess(f)
+	assert.Equal(t, 1, p.readyCount())
+
+	taken, ok := p.tryTakeReady()
+	require.True(t, ok)
+	require.Same(t, f, taken)
+	p.Return(f, true)
+	assert.Equal(t, 1, p.readyCount(), "a taken front can be queued again")
+
+	p.Replace(nil)
+	p.addReady(f)
+	assert.Equal(t, 1, p.readyCount(), "Replace's drain frees the front to be queued again")
+}
+
+// Concurrent connects can pick the same fallback front and both close it.
+func TestNewConnectedRoundTripper_OverlappingFallbacksQueueOnce(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	addr, cleanup := mockCDN(t, newTestLeafCert(t, caCert, caKey, "cdn.example.com"))
+	defer cleanup()
+
+	c := newRaceClient(t, caCert, map[string]*Provider{
+		"mapped": {HostAliases: map[string]string{"origin.example.com": "cdn.example.com"}, TestURL: pingURL},
+	})
+	f := cdnFront("mapped", addr)
+	c.pool.Replace([]*front{f})
+
+	var rts []http.RoundTripper
+	for range 3 {
+		rt, err := c.NewConnectedRoundTripper(context.Background(), "origin.example.com:443")
+		require.NoError(t, err)
+		// f stays out of the ready queue until closed, so each call
+		// falls back to it again.
+		rts = append(rts, rt)
+	}
+	for _, rt := range rts {
+		require.NoError(t, rt.(*connectedRoundTripper).Close())
+	}
+	assert.Equal(t, 1, c.pool.readyCount())
+}
