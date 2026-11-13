@@ -77,6 +77,11 @@ type Client struct {
 	readyQueueSize     int
 	wg                 sync.WaitGroup
 	gate               *pauseGate
+
+	// emptyPasses counts crawl passes in a row that vetted no front.
+	emptyPasses atomic.Int32
+	// crawlNow cuts the wait between crawl passes short.
+	crawlNow chan struct{}
 }
 
 // Option configures a Client.
@@ -181,6 +186,7 @@ func New(ctx context.Context, config *Config, options ...Option) (*Client, error
 		httpClient:         http.DefaultClient,
 		crawlerConcurrency: defaultCrawlerConcurrency,
 		gate:               newPauseGate(),
+		crawlNow:           make(chan struct{}, 1),
 	}
 
 	for _, opt := range options {
@@ -300,6 +306,7 @@ func (c *Client) applyConfig(cfg *Config) error {
 	rand.Shuffle(len(fronts), func(i, j int) { fronts[i], fronts[j] = fronts[j], fronts[i] })
 
 	c.pool.Replace(fronts)
+	c.resetCrawlBackoff()
 	c.log.Debug("Applied config", "providers", len(expanded), "fronts", len(fronts))
 	return nil
 }
@@ -350,8 +357,15 @@ func (c *Client) crawler() {
 		if !c.gate.wait(c.ctx) {
 			return
 		}
-		if c.pool.readyCount() < 2 {
-			c.crawlAllFronts()
+		if c.pool.readyCount() >= 2 {
+			c.emptyPasses.Store(0)
+		} else {
+			switch c.crawlAllFronts() {
+			case crawlVetted:
+				c.emptyPasses.Store(0)
+			case crawlEmpty:
+				c.emptyPasses.Add(1)
+			}
 		}
 
 		timer.Reset(c.nextCrawlDelay())
@@ -359,27 +373,58 @@ func (c *Client) crawler() {
 		case <-c.ctx.Done():
 			return
 		case <-timer.C:
+		case <-c.crawlNow:
+			timer.Stop()
 		}
 	}
 }
 
+// maxCrawlBackoffShift caps the backoff at 32x the base delay, a few minutes
+// between passes at the default.
+const maxCrawlBackoffShift = 5
+
 // nextCrawlDelay returns the pinned crawlInterval when set, otherwise a
-// jittered wait so a fleet of clients doesn't crawl in lockstep.
+// jittered wait so a fleet of clients doesn't crawl in lockstep. Each pass in
+// a row that vetted nothing doubles it: when every front is unreachable,
+// redialing the whole list every few seconds only costs battery.
 func (c *Client) nextCrawlDelay() time.Duration {
-	if c.crawlInterval > 0 {
-		return c.crawlInterval
+	d := c.crawlInterval
+	if d <= 0 {
+		d = time.Duration(6+rand.IntN(7)) * time.Second
 	}
-	return time.Duration(6+rand.IntN(7)) * time.Second
+	return d << min(c.emptyPasses.Load(), maxCrawlBackoffShift)
 }
 
-func (c *Client) crawlAllFronts() {
+// resetCrawlBackoff drops the backoff and starts the next pass right away. It
+// is for when the reason the last passes failed may be gone: a network change
+// or a new front list.
+func (c *Client) resetCrawlBackoff() {
+	c.emptyPasses.Store(0)
+	select {
+	case c.crawlNow <- struct{}{}:
+	default:
+	}
+}
+
+type crawlResult int
+
+const (
+	// crawlSkipped is a pass that says nothing about reachability: there was
+	// nothing to dial, or it was cut short by a pause or shutdown.
+	crawlSkipped crawlResult = iota
+	crawlVetted
+	crawlEmpty
+)
+
+func (c *Client) crawlAllFronts() crawlResult {
 	candidates := c.pool.candidates()
 	if len(candidates) == 0 {
-		return
+		return crawlSkipped
 	}
 
 	sem := make(chan struct{}, c.crawlerConcurrency)
 	var wg sync.WaitGroup
+	var vetted atomic.Int32
 
 	for _, f := range candidates {
 		if c.ctx.Err() != nil || c.gate.isPaused() {
@@ -400,6 +445,7 @@ func (c *Client) crawlAllFronts() {
 			}
 
 			if c.vetFront(f) {
+				vetted.Add(1)
 				f.markSucceeded()
 				c.pool.addReady(f)
 				c.notifyCacheDirty()
@@ -411,6 +457,15 @@ func (c *Client) crawlAllFronts() {
 	}
 
 	wg.Wait()
+
+	switch {
+	case vetted.Load() > 0:
+		return crawlVetted
+	case c.ctx.Err() != nil || c.gate.isPaused():
+		return crawlSkipped
+	default:
+		return crawlEmpty
+	}
 }
 
 func (c *Client) vetFront(f *front) bool {
