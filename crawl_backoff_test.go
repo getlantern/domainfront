@@ -68,3 +68,26 @@ func TestClient_CrawlerBacksOffWhenEveryFrontFails(t *testing.T) {
 		return dialer.dials.Load()-before >= 2*fronts
 	}, 500*time.Millisecond, 10*time.Millisecond, "resume did not reset the crawl backoff")
 }
+
+func TestClient_CrawlerBacksOffAfterFirstEmptyPass(t *testing.T) {
+	const fronts = 5
+	dialer := &refusingDialer{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// New queues a wake-up before the first pass. That pass must use it up,
+	// so the 400ms wait after it still applies.
+	client, err := New(ctx, manyFrontsConfig(fronts),
+		WithDialer(dialer),
+		withCrawlInterval(200*time.Millisecond),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.Eventually(t, func() bool {
+		return dialer.dials.Load() >= fronts
+	}, time.Second, 5*time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+	assert.Equal(t, int32(fronts), dialer.dials.Load(), "second pass skipped the backoff")
+}

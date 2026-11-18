@@ -357,6 +357,12 @@ func (c *Client) crawler() {
 		if !c.gate.wait(c.ctx) {
 			return
 		}
+		// This pass serves any wake-up already queued, like the one New
+		// leaves. Left queued, it would skip the delay after the pass.
+		select {
+		case <-c.crawlNow:
+		default:
+		}
 		if c.pool.readyCount() >= 2 {
 			c.emptyPasses.Store(0)
 		} else {
@@ -375,6 +381,9 @@ func (c *Client) crawler() {
 		case <-timer.C:
 		case <-c.crawlNow:
 			timer.Stop()
+			// The reset may have come mid-pass, before that pass counted
+			// itself empty.
+			c.emptyPasses.Store(0)
 		}
 	}
 }
