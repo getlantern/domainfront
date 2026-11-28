@@ -31,13 +31,16 @@ func (g *pauseGate) pause() {
 	}
 }
 
-func (g *pauseGate) resume() {
+// resume reports whether the gate was paused.
+func (g *pauseGate) resume() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	select {
 	case <-g.resumed:
+		return false
 	default:
 		close(g.resumed)
+		return true
 	}
 }
 
@@ -99,7 +102,10 @@ func (c *Client) Pause() {
 
 // Resume restarts the background work suspended by Pause, and does nothing if
 // the Client is not paused. Work that came due while paused runs when Resume
-// lands.
+// lands. Crawling starts over without backoff, since whatever blocked the
+// fronts before the pause may be gone.
 func (c *Client) Resume() {
-	c.gate.resume()
+	if c.gate.resume() {
+		c.resetCrawlBackoff()
+	}
 }
